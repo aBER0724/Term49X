@@ -1,6 +1,6 @@
-Welcome to Term49C!
+Welcome to Term49X!
 
-Term49C ("C" = Classic) is a BB10 terminal
+Term49X ("C" = Classic) is a BB10 terminal
 tuned for BlackBerry Classic hardware
 (keyboard, trackpad, belt keys). Lineage:
 Term48 / Term49.
@@ -111,7 +111,7 @@ Shift held or sticky ↑:
 ~/.term49rc (libconfig). Created on first
 run. Errors → compiled defaults.
 
-Term49C defaults (selected):
+Term49X defaults (selected):
 
 font_path = "/usr/fonts/font_repository/dejavu/DejaVuSansMono.ttf";
 fallback_font_path = "../app/native/fonts/CascadiaMonoPL-Regular.ttf";
@@ -186,14 +186,14 @@ prefs_version = <int>
 
 6. WHAT'S INSTALLED
 
-Basic QNX tools + python + elvis. Term49C
+Basic QNX tools + python + elvis. Term49X
 adds mksh, ssh, scp, sftp, ssh-keygen.
 
 ============================================
 
 7. SOURCE
 
-https://github.com/jxw1102/Term49C
+https://github.com/jxw1102/Term49X
 
 Upstream: BerryFarm/Term49, mordak/Term48.
 Issues and PRs welcome.

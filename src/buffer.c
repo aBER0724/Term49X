@@ -21,6 +21,7 @@
 #include "terminal.h"
 
 #include "buffer.h"
+#include "session.h"
 
 static uint32_t saved_buf_p;
 static saved_buf_t* saved_buf;
@@ -191,6 +192,7 @@ void buf_erase_line(struct screenchar* sc, size_t n){
   for(i = 0; i < n; ++i){
     buf_free_char(&sc[i]);
     sc[i].c = ' ';
+    sc[i].c2 = 0;
     sc[i].style = buf->current_style;
     sc[i].wide = 0;
   }
@@ -677,4 +679,139 @@ void buf_restore_cursor(){
     PRINT(stderr, " --- Error - buf->line was < 0, this shouldn't happen\n");
     buf->line = buf->top_line;
   }
+}
+
+/* ---- per-session buffer state --------------------------------------
+ * The engine above runs on globals; these four functions move a whole
+ * terminal's grid in and out of a session_t so the UI can park one and
+ * resume another. They are deliberately allocation-free copies (except
+ * for init/free), because a switch happens with the input lock held and
+ * has to be fast: switching tabs must feel like flipping a view, not
+ * like starting an app.
+ */
+
+int buffer_state_init(struct session_t *s){
+  int i, n;
+
+  s->screens = (buf_t*)calloc(NUM_BUFFERS, sizeof(buf_t));
+  if(s->screens == NULL){ return TERM_FAILURE; }
+
+  for(n = 0; n < NUM_BUFFERS; ++n){
+    buf_t *b = &s->screens[n];
+    b->line = 0;
+    b->col = 0;
+    b->top_line = 0;
+    b->view_offset = 0;
+    b->inverse_video = 0;
+    b->origin = 0;
+    b->current_style = default_text_style;
+    b->text = (struct screenchar**)calloc(TEXT_BUFFER_SIZE + 1, sizeof(struct screenchar*));
+    if(b->text == NULL){ return TERM_FAILURE; }
+    for(i = 0; i < TEXT_BUFFER_SIZE + 1; ++i){
+      int j;
+      b->text[i] = (struct screenchar*)calloc(MAX_COLS + 1, sizeof(struct screenchar));
+      if(b->text[i] == NULL){ return TERM_FAILURE; }
+      for(j = 0; j < MAX_COLS + 1; ++j){
+        b->text[i][j].c = ' ';
+        b->text[i][j].c2 = 0;
+        b->text[i][j].style = b->current_style;
+        b->text[i][j].wide = 0;
+        b->text[i][j].surface = NULL;
+      }
+    }
+  }
+  s->buf = &s->screens[0];
+
+  s->sr.top = 1;
+  s->sr.bottom = rows;
+
+  s->tabs = (char**)calloc(MAX_ROWS + 1, sizeof(char*));
+  if(s->tabs == NULL){ return TERM_FAILURE; }
+  for(i = 1; i <= MAX_ROWS; ++i){
+    int x;
+    s->tabs[i] = (char*)calloc(MAX_COLS + 1, sizeof(char));
+    if(s->tabs[i] == NULL){ return TERM_FAILURE; }
+    for(x = 1; x <= MAX_COLS; x += TAB_WIDTH){
+      s->tabs[i][x] = 1;
+    }
+    if(i % TAB_HEIGHT == 0){
+      s->tabs[i][MAX_COLS] = 1;
+    }
+  }
+
+  s->saved_buf = (saved_buf_t*)calloc(NUM_BUFFERS, sizeof(saved_buf_t));
+  if(s->saved_buf == NULL){ return TERM_FAILURE; }
+  s->saved_buf_p = 0;
+  for(i = 0; i < NUM_BUFFERS; ++i){
+    s->saved_buf[i].row = 0;
+    s->saved_buf[i].col = 0;
+    s->saved_buf[i].origin = 0;
+    s->saved_buf[i].inverse_video = 0;
+    s->saved_buf[i].current_style = s->screens[i].current_style;
+  }
+
+  s->sel_active = 0;
+  s->sel_anchor[0] = s->sel_anchor[1] = 0;
+  s->sel_point[0] = s->sel_point[1] = 0;
+
+  return TERM_SUCCESS;
+}
+
+void buffer_state_free(struct session_t *s){
+  int i, n;
+
+  if(s->screens != NULL){
+    for(n = 0; n < NUM_BUFFERS; ++n){
+      buf_t *b = &s->screens[n];
+      if(b->text == NULL){ continue; }
+      for(i = 0; i < TEXT_BUFFER_SIZE + 1; ++i){
+        free(b->text[i]);
+      }
+      free(b->text);
+      b->text = NULL;
+    }
+    free(s->screens);
+    s->screens = NULL;
+  }
+  if(s->tabs != NULL){
+    for(i = 1; i <= MAX_ROWS; ++i){
+      free(s->tabs[i]);
+    }
+    free(s->tabs);
+    s->tabs = NULL;
+  }
+  if(s->saved_buf != NULL){
+    free(s->saved_buf);
+    s->saved_buf = NULL;
+  }
+}
+
+void buffer_state_save(struct session_t *s){
+  s->screens = screens;
+  s->buf = buf;
+  s->saved_buf = saved_buf;
+  s->saved_buf_p = saved_buf_p;
+  s->tabs = tabs;
+  s->sr = sr;
+  s->sel_active = sel_active;
+  s->sel_anchor[0] = sel_anchor[0];
+  s->sel_anchor[1] = sel_anchor[1];
+  s->sel_point[0] = sel_point[0];
+  s->sel_point[1] = sel_point[1];
+}
+
+void buffer_state_load(struct session_t *s){
+  screens = s->screens;
+  buf = s->buf;
+  saved_buf = s->saved_buf;
+  saved_buf_p = s->saved_buf_p;
+  tabs = s->tabs;
+  sr = s->sr;
+  sel_active = s->sel_active;
+  sel_anchor[0] = s->sel_anchor[0];
+  sel_anchor[1] = s->sel_anchor[1];
+  sel_point[0] = s->sel_point[0];
+  sel_point[1] = s->sel_point[1];
+  /* buf must point into this session's screens, never into a parked one */
+  if(buf == NULL){ buf = &screens[0]; }
 }

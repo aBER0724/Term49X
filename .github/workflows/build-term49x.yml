@@ -1,4 +1,4 @@
-name: Build Term49C
+name: Build Term49X
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   build:
-    name: Build unsigned Term49C BAR
+    name: Build unsigned Term49X BAR
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -39,7 +39,7 @@ jobs:
       BBNDK_ENV: /home/admin/bin/bbndk/bbndk-env_10_3_1_995.sh
 
     steps:
-      - name: Checkout Term49C
+      - name: Checkout Term49X
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -193,7 +193,7 @@ jobs:
           file external/lib/libSDL12.so
           sha256sum external/lib/libSDL12.so | tee libSDL12.so.sha256
 
-      - name: Build and package Term49C
+      - name: Build and package Term49X
         shell: bash
         run: |
           set -euo pipefail
@@ -232,7 +232,7 @@ jobs:
               : > signing/bbpass
 
               find src -type f -name "*.o" -delete
-              rm -f Device-Debug/Term49 Term49C.bar
+              rm -f Device-Debug/Term49 Term49X.bar
 
               /bin/bash scripts/container-build.sh
             '
@@ -243,12 +243,12 @@ jobs:
           set -euo pipefail
 
           test -s Device-Debug/Term49
-          test -s Term49C.bar
+          test -s Term49X.bar
 
           file Device-Debug/Term49
-          file Term49C.bar
-          ls -lh Device-Debug/Term49 Term49C.bar
-          sha256sum Term49C.bar | tee Term49C.bar.sha256
+          file Term49X.bar
+          ls -lh Device-Debug/Term49 Term49X.bar
+          sha256sum Term49X.bar | tee Term49X.bar.sha256
 
       - name: Verify packaged SDL and font
         shell: bash
@@ -257,7 +257,7 @@ jobs:
 
           rm -rf verify-bar
           mkdir -p verify-bar
-          unzip -q Term49C.bar -d verify-bar
+          unzip -q Term49X.bar -d verify-bar
 
           bar_sdl="$(find verify-bar -type f -name 'libSDL12.so*' -print -quit)"
           bar_font="$(find verify-bar -type f -name 'CascadiaMonoPL-Regular.ttf' -print -quit)"
@@ -277,7 +277,7 @@ jobs:
           cmp external/lib/libSDL12.so "$bar_sdl"
           cmp external/fonts/CascadiaMonoPL-Regular.ttf "$bar_font"
 
-          echo "OK: patched SDL and Cascadia font are present in Term49C.bar"
+          echo "OK: patched SDL and Cascadia font are present in Term49X.bar"
 
       - name: Create build information
         shell: bash
@@ -285,7 +285,7 @@ jobs:
           set -euo pipefail
 
           {
-            echo "Term49C Q20 trackpad build"
+            echo "Term49X Q20 trackpad build"
             echo
             echo "Main commit:"
             git rev-parse HEAD
@@ -297,7 +297,7 @@ jobs:
             echo "$BBNDK_IMAGE"
             echo
             echo "BAR:"
-            sha256sum Term49C.bar
+            sha256sum Term49X.bar
             echo
             echo "SDL:"
             sha256sum external/lib/libSDL12.so
@@ -308,13 +308,13 @@ jobs:
 
           cat build-info.txt
 
-      - name: Upload Term49C artifact
+      - name: Upload Term49X artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Term49C-Q20-trackpad-${{ github.run_number }}
+          name: Term49X-Q20-trackpad-${{ github.run_number }}
           path: |
-            Term49C.bar
-            Term49C.bar.sha256
+            Term49X.bar
+            Term49X.bar.sha256
             libSDL12.so.sha256
             build-info.txt
           if-no-files-found: error

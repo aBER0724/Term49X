@@ -24,6 +24,91 @@
 #define ANSWERBACK "Term49"
 #define OUTBUF_LEN 30
 
+#include <unicode/utf.h>
+
+/* ---- per-session terminal state -------------------------------------
+ * Everything the ECMA-48 parser has to remember between two reads of
+ * child output lives in this structure. There is one of these per
+ * session, so a session switch is a struct copy (see ecma48_state_*
+ * below) and the parser code keeps using the bare names `state`,
+ * `modes`, `osc_buf`, ... through the macros in ecma48.c.
+ */
+
+#define NUM_ESCAPE_ARGS 16
+/* OSC (operating system command) accumulator, large enough for OSC 52
+ * clipboard payloads (base64) */
+#define ECMA48_OSC_BUF_SIZE 8192
+
+struct escape_arguments {
+  char** args;
+  int num;
+  int pos;
+  char ibyte;
+};
+
+struct ecma48_modes {
+  char BDSM;
+  char CRM;
+  char DCSM;
+  char ERM;
+  char FEAM;
+  char FETM;
+  char GATM;
+  char GRCM;
+  char HEM;
+  char IRM;
+  char KAM;
+  char MATM;
+  char PUM;
+  char SATM;
+  char SRM;
+  char SRTM;
+  char TSM;
+  char LNM;
+  char TTM;
+  char VEM;
+  char ZDM;
+  char SIMD;
+  char DECCKM;
+  char DECCOLM;
+  int  mouse_mode;   /* xterm mouse tracking: DECSET 9/1000/1002/1003, 0 = off */
+  char mouse_sgr;    /* DECSET 1006: SGR extended mouse coordinates */
+  char bracketed_paste; /* DECSET 2004 */
+};
+
+struct ecma48_state {
+  char state;
+  char writing_buffer;
+  char autowrap;
+  char rautowrap;
+  struct escape_arguments escape_args;
+  struct ecma48_modes modes;
+  UChar last_char;
+  char osc_buf[ECMA48_OSC_BUF_SIZE];
+  int  osc_len;
+  char osc_overflow;
+  char charset[2];
+  char charset_shift;
+  char scs_designator;
+  int  cursor_shape;  /* DECSCUSR: 0/1/2 block, 3/4 underline, 5/6 bar */
+};
+
+/* Initialize/free a detached state block (used when a session is created
+ * while another one is live: the live state must not be disturbed). */
+/* Byte sent for the Backspace key, and programmed as the pty's VERASE:
+ * 0x7f (DEL, xterm default, what TUI apps like claude/vim expect) or
+ * 0x08 (^H, what the QNX tty defaults to). */
+void ecma48_set_backspace(char b);
+char ecma48_backspace(void);
+
+void ecma48_state_init(struct ecma48_state *st);
+void ecma48_state_free(struct ecma48_state *st);
+/* Copy the live parser state out (save) or in (load) on a session switch */
+void ecma48_state_save(struct ecma48_state *dst);
+void ecma48_state_load(const struct ecma48_state *src);
+int  ecma48_cursor_shape();
+void ecma48_reset_cursor_shape();
+
 void ecma48_init();
 void ecma48_uninit();
 void ecma48_setenv();

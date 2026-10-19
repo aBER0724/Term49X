@@ -31,9 +31,18 @@
 /* from ecma48.c */
 extern int ecma48_bracketed_paste();
 
-static int master_fd;
-static UConverter* tty_conv;
-static UErrorCode  tty_conv_err = U_ZERO_ERROR;
+/* from main.c: byte trace of what the terminal sends to the shell */
+extern void io_trace_write(const char *buf, size_t len, ssize_t wrote);
+
+static int master_fd = -1;
+/* One converter per direction. ICU converters are stateful: the read side
+ * holds back the first bytes of a multi-byte character until the rest
+ * arrives. Sharing one converter between reading shell output and encoding
+ * typed input (and the keyhold upcase lookup) let that held-back state leak
+ * into unrelated conversions, which garbled echoed CJK text. */
+static UConverter* tty_in_conv;     /* shell output  -> UChar (stateful) */
+static UConverter* tty_out_conv;    /* typed input   -> tty encoding */
+static UConverter* tty_peek_conv;   /* last write    -> UChar (upcase) */
 
 static UConverter* utf8_conv;
 static UErrorCode  utf8_conv_err = U_ZERO_ERROR;
@@ -45,17 +54,28 @@ static char* writebufLimit;
 int io_init(pref_t *prefs){
 
 	// create converters
-	tty_conv  = ucnv_open(prefs->tty_encoding, &tty_conv_err);
+	UErrorCode e1 = U_ZERO_ERROR, e2 = U_ZERO_ERROR, e3 = U_ZERO_ERROR;
+	tty_in_conv   = ucnv_open(prefs->tty_encoding, &e1);
+	tty_out_conv  = ucnv_open(prefs->tty_encoding, &e2);
+	tty_peek_conv = ucnv_open(prefs->tty_encoding, &e3);
 	utf8_conv  = ucnv_open("UTF-8", &utf8_conv_err);
+	if(U_FAILURE(e1) || U_FAILURE(e2) || U_FAILURE(e3)){
+		fprintf(stderr, "Could not open converters for %s\n", prefs->tty_encoding);
+	}
 	return TERM_SUCCESS;
 }
 
 void io_uninit(){
 
 	// free converts
-	ucnv_close(tty_conv);
-	ucnv_close(utf8_conv);
-  close(master_fd);
+	if(tty_in_conv != NULL){ ucnv_close(tty_in_conv); tty_in_conv = NULL; }
+	if(tty_out_conv != NULL){ ucnv_close(tty_out_conv); tty_out_conv = NULL; }
+	if(tty_peek_conv != NULL){ ucnv_close(tty_peek_conv); tty_peek_conv = NULL; }
+	if(utf8_conv != NULL){ ucnv_close(utf8_conv); utf8_conv = NULL; }
+  /* the session owning this fd closed it already; closing the number
+   * again could hit an unrelated file opened in between */
+  if(master_fd >= 0){ close(master_fd); }
+  master_fd = -1;
 }
 
 void io_set_master(int fd){
@@ -89,10 +109,13 @@ int32_t io_upcase_last_write(UChar **buf, int32_t nUChar){
 	targetLimit = c + CHARACTER_BUFFER;
 	source = writebuf;
 	sourceLimit = writebufLimit;
-	ucnv_toUnicode(tty_conv, &target, targetLimit, &source, sourceLimit, NULL, FALSE, &tty_conv_err);
-	if(tty_conv_err == U_BUFFER_OVERFLOW_ERROR){
-		fprintf(stderr, "ucnv_toUnicode() in io_upcase_last_write ran out of target buffer\n");
-		tty_conv_err = U_ZERO_ERROR;
+	{
+		UErrorCode err = U_ZERO_ERROR;
+		ucnv_reset(tty_peek_conv);
+		ucnv_toUnicode(tty_peek_conv, &target, targetLimit, &source, sourceLimit, NULL, TRUE, &err);
+		if(err == U_BUFFER_OVERFLOW_ERROR){
+			fprintf(stderr, "ucnv_toUnicode() in io_upcase_last_write ran out of target buffer\n");
+		}
 	}
 	lCaseLen = (int32_t)(target - c);
 	uCaseLen = u_strToUpper(*buf, nUChar, c, lCaseLen, NULL, &uCaseErr);
@@ -119,7 +142,14 @@ int32_t io_upcase_last_write(UChar **buf, int32_t nUChar){
  * UI thread with the input lock held. */
 #define WRITE_RETRY_USEC  1000
 #define WRITE_RETRY_LIMIT 200   /* ~200ms */
+static ssize_t write_all_master_raw(const char* buf, size_t len);
 static ssize_t write_all_master(const char* buf, size_t len){
+  ssize_t w = write_all_master_raw(buf, len);
+  io_trace_write(buf, len, w);
+  return w;
+}
+
+static ssize_t write_all_master_raw(const char* buf, size_t len){
   size_t off = 0;
   int tries = 0;
   while(off < len){
@@ -154,12 +184,16 @@ ssize_t io_write_master(const UChar *buf, size_t nUChar){
 	const UChar* source = buf;
 	const UChar* sourceLimit = buf + nUChar;
 
-	ucnv_fromUnicode(tty_conv, &target, targetLimit, &source, sourceLimit, NULL, TRUE, &tty_conv_err);
-
-  if(tty_conv_err == U_BUFFER_OVERFLOW_ERROR){
-  	fprintf(stderr, "ucnv_fromUnicode() in io_write_master ran out of target buffer\n");
-  	tty_conv_err = U_ZERO_ERROR;
-  }
+	{
+		UErrorCode err = U_ZERO_ERROR;
+		ucnv_fromUnicode(tty_out_conv, &target, targetLimit, &source, sourceLimit, NULL, TRUE, &err);
+		if(err == U_BUFFER_OVERFLOW_ERROR){
+			fprintf(stderr, "ucnv_fromUnicode() in io_write_master ran out of target buffer\n");
+		} else if(U_FAILURE(err)){
+			/* never let a sticky error swallow every later key */
+			ucnv_reset(tty_out_conv);
+		}
+	}
 
   writebufLimit = target;
 	return write_all_master(writebuf, (size_t)(target - writebuf));
@@ -189,13 +223,25 @@ ssize_t io_read_master(UChar *buf, size_t nUChar){
 	target = buf;
 	targetLimit = buf + nUChar;
 
-  ucnv_toUnicode(tty_conv, &target, targetLimit, &source, sourceLimit, NULL, FALSE, &tty_conv_err);
-
-  if(tty_conv_err == U_BUFFER_OVERFLOW_ERROR){
-  	fprintf(stderr, "ucnv_toUnicode() in io_read_master ran out of target buffer\n");
-  	tty_conv_err = U_ZERO_ERROR;
+  {
+    UErrorCode err = U_ZERO_ERROR;
+    ucnv_toUnicode(tty_in_conv, &target, targetLimit, &source, sourceLimit, NULL, FALSE, &err);
+    if(err == U_BUFFER_OVERFLOW_ERROR){
+      fprintf(stderr, "ucnv_toUnicode() in io_read_master ran out of target buffer\n");
+    } else if(U_FAILURE(err)){
+      ucnv_reset(tty_in_conv);
+    }
   }
 
+  /* Bytes arrived but they are only the start of a multi-byte character
+   * (e.g. 1-2 bytes of a 3-byte UTF-8 CJK glyph): the converter keeps them
+   * for the next read and produced nothing yet. That is "no data yet", not
+   * end of file - returning 0 here made the caller treat the pty as closed
+   * and kill the session whenever a CJK character was split across reads. */
+  if(target == buf){
+    errno = EAGAIN;
+    return -1;
+  }
   return (ssize_t)(target - buf);
 }
 

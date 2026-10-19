@@ -43,7 +43,6 @@
 #define ECMA48_STATE_ANSI_SCS 5
 #define ECMA48_STATE_ANSI_RANG 6
 #define ECMA48_STATE_CONFORMANCE 7
-static char state = ECMA48_STATE_NORMAL;
 
 #define BUFFER_NORMAL 0
 #define BUFFER_OSC 1
@@ -51,66 +50,39 @@ static char state = ECMA48_STATE_NORMAL;
 #define BUFFER_APC 3
 #define BUFFER_PM 4
 
-static char writing_buffer = BUFFER_NORMAL;
+#define OSC_BUF_SIZE ECMA48_OSC_BUF_SIZE
+/* The live (active session) parser state. Every parser routine below uses
+ * the plain names through these macros, so switching sessions is a single
+ * struct copy in ecma48_state_load(). */
+static struct ecma48_state g_vt;
 
-static char autowrap = 1;
-static char rautowrap = 0;
+/* 0x7f by default: modern full-screen apps (claude, vim, less) only treat
+ * DEL as backspace, while ^H is read as Ctrl-H. The shell is unaffected
+ * either way (mksh/zsh bind both), and the pty's VERASE is set to match. */
+static char backspace_byte = 0x7f;
 
-#define NUM_ESCAPE_ARGS 16
-struct escape_arguments {
-  char** args;
-  int num;
-  int pos;
-  char ibyte;
-};
+void ecma48_set_backspace(char b){
+  backspace_byte = b;
+}
 
-static struct escape_arguments escape_args;
+char ecma48_backspace(void){
+  return backspace_byte;
+}
 
-struct ecma48_modes {
-  char BDSM;
-  char CRM;
-  char DCSM;
-  char ERM;
-  char FEAM;
-  char FETM;
-  char GATM;
-  char GRCM;
-  char HEM;
-  char IRM;
-  char KAM;
-  char MATM;
-  char PUM;
-  char SATM;
-  char SRM;
-  char SRTM;
-  char TSM;
-  char LNM;
-  char TTM;
-  char VEM;
-  char ZDM;
-  char SIMD;
-  char DECCKM;
-  char DECCOLM;
-  int  mouse_mode;   /* xterm mouse tracking: DECSET 9/1000/1002/1003, 0 = off */
-  char mouse_sgr;    /* DECSET 1006: SGR extended mouse coordinates */
-  char bracketed_paste; /* DECSET 2004 */
-};
-
-static struct ecma48_modes modes;
-static UChar last_char;
-
-/* OSC (operating system command) string accumulator, large enough for
- * OSC 52 clipboard payloads (base64) */
-#define OSC_BUF_SIZE 8192
-static char osc_buf[OSC_BUF_SIZE];
-static int  osc_len = 0;
-static char osc_overflow = 0;
-
-/* SCS character sets: G0/G1 designations ('B' = US ASCII, '0' = DEC
- * Special Graphics) and the shift state selected by SI/SO */
-static char charset[2] = {'B', 'B'};
-static char charset_shift = 0;
-static char scs_designator = '(';
+#define state           (g_vt.state)
+#define writing_buffer  (g_vt.writing_buffer)
+#define autowrap        (g_vt.autowrap)
+#define rautowrap       (g_vt.rautowrap)
+#define escape_args     (g_vt.escape_args)
+#define modes           (g_vt.modes)
+#define last_char       (g_vt.last_char)
+#define osc_buf         (g_vt.osc_buf)
+#define osc_len         (g_vt.osc_len)
+#define osc_overflow    (g_vt.osc_overflow)
+#define charset         (g_vt.charset)
+#define charset_shift   (g_vt.charset_shift)
+#define scs_designator  (g_vt.scs_designator)
+#define cursor_shape    (g_vt.cursor_shape)
 
 /* DEC Special Graphics (ESC ( 0), code points 0x60..0x7e. The four
  * horizontal scan-line glyphs are approximated with U+2500 since most
@@ -144,7 +116,6 @@ static void ecma48_clear_wrap(){
 
 /* from main.c */
 extern char draw_cursor;
-extern int cursor_shape;
 extern char flash;
 extern struct font_style default_text_style;
 
@@ -187,62 +158,49 @@ void ecma48_set_cursor_home(){
 	ecma48_CUP();
 }
 
+static void reset_modes(struct ecma48_modes *m){
+  m->BDSM = 0;
+  m->CRM = 0;
+  m->DCSM = 0;
+  m->ERM = 0;
+  m->FEAM = 0;
+  m->FETM = 0;
+  m->GATM = 0;
+  m->GRCM = 0;
+  m->HEM = 0; /* 0 for FOLLOWING, 1 for PRECEDING */
+  m->IRM = 0;
+  m->KAM = 0;
+  m->MATM = 0;
+  m->PUM = 0;
+  m->SATM = 0;
+  m->SRM = 0;
+  m->SRTM = 0;
+  m->TSM = 0;
+  m->LNM = 0;
+  m->TTM = 0;
+  m->VEM = 0;
+  m->ZDM = 0;
+  m->SIMD = 0;
+  m->DECCKM = 0;
+  m->DECCOLM = 0;
+  m->mouse_mode = 0;
+  m->mouse_sgr = 0;
+  m->bracketed_paste = 0;
+}
+
 void ecma48_resetModes(){
-  modes.BDSM = 0;
-  modes.CRM = 0;
-  modes.DCSM = 0;
-  modes.ERM = 0;
-  modes.FEAM = 0;
-  modes.FETM = 0;
-  modes.GATM = 0;
-  modes.GRCM = 0;
-  modes.HEM = 0; /* 0 for FOLLOWING, 1 for PRECEDING */
-  modes.IRM = 0;
-  modes.KAM = 0;
-  modes.MATM = 0;
-  modes.PUM = 0;
-  modes.SATM = 0;
-  modes.SRM = 0;
-  modes.SRTM = 0;
-  modes.TSM = 0;
-  modes.LNM = 0;
-  modes.TTM = 0;
-  modes.VEM = 0;
-  modes.ZDM = 0;
-  modes.SIMD = 0;
-  modes.DECCKM = 0;
-  modes.DECCOLM = 0;
-  modes.mouse_mode = 0;
-  modes.mouse_sgr = 0;
-  modes.bracketed_paste = 0;
+  reset_modes(&modes);
   charset[0] = 'B';
   charset[1] = 'B';
   charset_shift = 0;
 }
 
 void ecma48_init(){
-  int i;
-  /* malloc the escape code arguments */
-  escape_args.args = (char**)calloc(NUM_ESCAPE_ARGS, sizeof(char*));
-  for(i=0; i< NUM_ESCAPE_ARGS;++i){
-    escape_args.args[i] = (char*)calloc(NUM_ESCAPE_ARGS, sizeof(char));
-  }
-
-  /* set the initial modes */
-  ecma48_resetModes();
+  ecma48_state_init(&g_vt);
 }
 
 void ecma48_uninit(){
-  int i;
-  for(i=0; i< NUM_ESCAPE_ARGS;++i){
-    if(escape_args.args[i] != NULL){
-      free(escape_args.args[i]);
-    }
-  }
-  if(escape_args.args != NULL){
-    free(escape_args.args);
-  }
-
+  ecma48_state_free(&g_vt);
 }
 
 void ecma48_setenv(){
@@ -255,12 +213,7 @@ void ecma48_setenv(){
     }
   }
   setenv("TERM", "xterm-256color", 1);
-
-  //if(system("/base/bin/stty +sane term=xterm-color erase=^H") == -1){
-  if(system("/base/bin/stty +sane erase=^H") == -1){
-    PRINT(stderr, "Error invoking system(stty..)\n");
-  }
-
+  /* erase/VERASE is set on the pty itself when the session is spawned */
 }
 
 void ecma48_end_control(){
@@ -270,23 +223,59 @@ void ecma48_end_control(){
 
 /* display columns a character occupies: 2 for East-Asian wide/fullwidth
  * (CJK), 1 otherwise. */
-static int ecma48_char_width(UChar c){
+static int ecma48_char_width32(UChar32 c){
   if(c < 0x1100){ /* fast path: Latin, punctuation, controls */
     return 1;
   }
-  int ea = u_getIntPropertyValue((UChar32)c, UCHAR_EAST_ASIAN_WIDTH);
-  return (ea == U_EA_WIDE || ea == U_EA_FULLWIDTH) ? 2 : 1;
+  {
+    int ea = u_getIntPropertyValue(c, UCHAR_EAST_ASIAN_WIDTH);
+    return (ea == U_EA_WIDE || ea == U_EA_FULLWIDTH) ? 2 : 1;
+  }
 }
 
-void ecma48_add_char(UChar c){
+static int ecma48_char_width(UChar c){
+  return ecma48_char_width32((UChar32)c);
+}
 
-  /* apply the active SCS charset (DEC Special Graphics line drawing) */
-  if(charset[(int)charset_shift] == '0' && c >= 0x60 && c <= 0x7e){
-    c = dec_special_graphics[c - 0x60];
+/* combining marks attach to the cell before the cursor instead of taking a
+ * cell of their own (accents, Indic vowel signs, Thai tone marks, ZWJ pieces) */
+static int is_combining(UChar c){
+  int t;
+  if(c < 0x0300){ /* nothing combining lives below this */
+    return 0;
   }
+  t = u_charType((UChar32)c);
+  return (t == U_NON_SPACING_MARK || t == U_ENCLOSING_MARK ||
+          t == U_COMBINING_SPACING_MARK);
+}
 
-  if(writing_buffer == BUFFER_NORMAL){
-    int cw = ecma48_char_width(c);
+/* high surrogate waiting for its low half (non-BMP characters) */
+static UChar pending_high = 0;
+
+/* If the cursor sits on the trailing half of a double-width character,
+ * clear the whole character first. Shells redraw a line by moving one
+ * column and writing a space, which would otherwise leave the left half of
+ * a CJK glyph on screen (mksh does "\b \b", bash "\b ESC[K"). */
+static void ecma48_unlink_wide_at(int row, int col){
+  struct screenchar *sc;
+  struct screenchar *lead;
+  if(col <= 0 || col >= cols){
+    return;
+  }
+  sc = &(buf->text[row][col]);
+  if(sc->wide != 2){
+    return;
+  }
+  lead = &(buf->text[row][col - 1]);
+  buf_free_char(lead);
+  lead->c = ' ';
+  lead->c2 = 0;
+  lead->style = buf->current_style;
+  lead->wide = 0;
+}
+
+/* put one cell (optionally with a second UTF-16 unit) and advance */
+static void ecma48_put_cell(UChar c, UChar c2, int cw){
     // check if we are being asked to write beyond the screen
     // if so, the program is not handling wrapping, so we wrap. A
     // double-width char also wraps when only one column is left.
@@ -305,12 +294,14 @@ void ecma48_add_char(UChar c){
   	  buf_insert_character(0);
   	  if(cw == 2){ buf_insert_character(0); }
   	}
+    ecma48_unlink_wide_at(buf->line, buf->col);
     struct screenchar *sc = &(buf->text[buf->line][buf->col]);
 
     /* free old char */
     buf_free_char(sc);
     /* write new one */
     sc->c = c;
+    sc->c2 = c2;
     sc->style = buf->current_style;
     sc->wide = (cw == 2) ? 1 : 0;
     if(buf->current_style.reverse){
@@ -324,13 +315,69 @@ void ecma48_add_char(UChar c){
       struct screenchar *cont = &(buf->text[buf->line][buf->col + 1]);
       buf_free_char(cont);
       cont->c = 0;
+      cont->c2 = 0;
       cont->style = sc->style;
       cont->wide = 2;
     }
     buf->col += cw;
+}
+
+/* attach a combining mark to the cell just before the cursor */
+static void ecma48_attach_mark(UChar c){
+  int col = buf->col;
+  struct screenchar *prev;
+  if(col > cols){ col = cols; }
+  if(col <= 0){
+    return;
+  }
+  prev = &(buf->text[buf->line][col - 1]);
+  if(prev->wide == 2 && col >= 2){
+    prev = &(buf->text[buf->line][col - 2]);
+  }
+  if(prev->c != 0 && prev->c2 == 0){
+    prev->c2 = c;
+  }
+}
+
+void ecma48_add_char(UChar c){
+
+  /* apply the active SCS charset (DEC Special Graphics line drawing) */
+  if(charset[(int)charset_shift] == '0' && c >= 0x60 && c <= 0x7e){
+    c = dec_special_graphics[c - 0x60];
+  }
+
+  if(writing_buffer == BUFFER_NORMAL){
+    /* non-BMP characters arrive as a UTF-16 surrogate pair: hold the high
+     * half and finish the cell when the low half arrives */
+    if(c >= 0xD800 && c <= 0xDBFF){
+      pending_high = c;
+      return;
+    }
+    if(c >= 0xDC00 && c <= 0xDFFF){
+      if(pending_high != 0){
+        UChar hi = pending_high;
+        UChar32 cp = 0x10000 + (((UChar32)hi - 0xD800) << 10) + ((UChar32)c - 0xDC00);
+        pending_high = 0;
+        ecma48_put_cell(hi, c, ecma48_char_width32(cp));
+        last_char = c;
+        return;
+      }
+      return;   /* stray low surrogate */
+    }
+    pending_high = 0;
+
+    /* combining marks do not take a cell of their own */
+    if(is_combining(c)){
+      ecma48_attach_mark(c);
+      return;
+    }
+    ecma48_put_cell(c, 0, ecma48_char_width(c));
     /* cache for REP */
     last_char = c;
-  } else if(writing_buffer == BUFFER_OSC){
+    return;
+  }
+
+  if(writing_buffer == BUFFER_OSC){
     /* accumulate the OSC string (params and base64 are plain ASCII) */
     if(osc_len < OSC_BUF_SIZE - 1){
       osc_buf[osc_len++] = (c < 0x80) ? (char)c : '?';
@@ -490,7 +537,7 @@ int ecma48_parse_control_codes(int sym, int mod, UChar* tbuf){
   // but if one of the modifier keys is down, we maybe do something different
   // Start by checking arrow keys and stuff
   switch (sym){
-  	case KEYCODE_BACKSPACE:		tbuf[0] = 010; break;
+  	case KEYCODE_BACKSPACE:		tbuf[0] = (UChar)backspace_byte; break;
   	case KEYCODE_TAB:
   		/* Shift+Tab sends back-tab (CSI Z) */
   		if((mod & KEYMOD_SHIFT) || (mod & KEYMOD_SHIFT_LOCK)){
@@ -2081,8 +2128,9 @@ void ecma48_ED(){
     case 2: // entire screen
       ecma48_clear_display();
       break;
-    case 3: // Erase saved lines (xterm)
-      // FIXME: Implment
+    case 3: // Erase saved lines (xterm): `clear` uses 2J + 3J
+      buf->top_line = buf->line;
+      buf->view_offset = 0;
       break;
   };
   ecma48_end_control();
@@ -2121,6 +2169,7 @@ void ecma48_EL(){
   int Pn = escape_args.args[0][0] != '\0' ? (int)strtol(escape_args.args[0], NULL, 10) : 0;
   switch (Pn) {
     case 0: // from cursor to end of line
+      ecma48_unlink_wide_at(buf->line, buf->col);
       buf_erase_line(&buf->text[buf->line][buf->col], (cols-buf->col));
       break;
     case 1: // from start of line to cursor
@@ -3150,6 +3199,7 @@ void ecma48_SGR(){
           buf->current_style.style |= TTF_STYLE_BOLD;
           break;
         case 2: // 2 faint, decreased intensity or second colour
+          buf->current_style.dim = 1;
           break;
         case 3: // 3 italicized
           buf->current_style.style |= TTF_STYLE_ITALIC;
@@ -3198,6 +3248,7 @@ void ecma48_SGR(){
           break;
         case 22: // 22 normal colour or normal intensity (neither bold nor faint)
           buf->current_style.style &= ~TTF_STYLE_BOLD;
+          buf->current_style.dim = 0;
           break;
         case 23: // 23 not italicized, not fraktur
           buf->current_style.style &= ~TTF_STYLE_ITALIC;
@@ -4025,19 +4076,72 @@ void ecma48_send_mouse_event(int cb, int press, int col, int row){
   }
 }
 
+/* ---- detached state blocks ------------------------------------------
+ * These live at the end of the file, after the parser code, so the macros
+ * above can be undone: `st->state` would otherwise expand to
+ * `st->(g_vt.state)`.
+ */
+#undef state
+#undef writing_buffer
+#undef autowrap
+#undef rautowrap
+#undef escape_args
+#undef modes
+#undef last_char
+#undef osc_buf
+#undef osc_len
+#undef osc_overflow
+#undef charset
+#undef charset_shift
+#undef scs_designator
+#undef cursor_shape
 
+/* Initialize a state block that is not (necessarily) the live one. */
+void ecma48_state_init(struct ecma48_state *st){
+  int i;
+  memset(st, 0, sizeof(*st));
+  st->state = ECMA48_STATE_NORMAL;
+  st->writing_buffer = BUFFER_NORMAL;
+  st->autowrap = 1;
+  st->rautowrap = 0;
+  st->scs_designator = '(';
+  st->charset[0] = 'B';
+  st->charset[1] = 'B';
+  st->cursor_shape = 0;
+  reset_modes(&st->modes);
 
+  st->escape_args.args = (char**)calloc(NUM_ESCAPE_ARGS, sizeof(char*));
+  if(st->escape_args.args == NULL){ return; }
+  for(i = 0; i < NUM_ESCAPE_ARGS; ++i){
+    st->escape_args.args[i] = (char*)calloc(NUM_ESCAPE_ARGS, sizeof(char));
+  }
+  st->escape_args.num = 0;
+  st->escape_args.pos = 0;
+  st->escape_args.ibyte = '\0';
+}
 
+void ecma48_state_free(struct ecma48_state *st){
+  int i;
+  if(st->escape_args.args == NULL){ return; }
+  for(i = 0; i < NUM_ESCAPE_ARGS; ++i){
+    free(st->escape_args.args[i]);
+  }
+  free(st->escape_args.args);
+  st->escape_args.args = NULL;
+}
 
+void ecma48_state_save(struct ecma48_state *dst){
+  *dst = g_vt;
+}
 
+void ecma48_state_load(const struct ecma48_state *src){
+  g_vt = *src;
+}
 
+int ecma48_cursor_shape(){
+  return g_vt.cursor_shape;
+}
 
-
-
-
-
-
-
-
-
-
+void ecma48_reset_cursor_shape(){
+  g_vt.cursor_shape = 0;
+}

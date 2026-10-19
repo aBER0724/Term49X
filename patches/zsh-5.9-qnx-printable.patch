@@ -1,0 +1,16 @@
+--- a/Src/ztype.h
++++ b/Src/ztype.h
+@@ -75,7 +75,12 @@
+ # ifdef ENABLE_UNICODE9
+ #  define WC_ISPRINT(X)	u9_iswprint(X)
+ # else
+-#  define WC_ISPRINT(X)	iswprint(X)
++/* QNX's iswprint() reports every non-ASCII wide character as unprintable in
++ * the C locale, which makes zle draw CJK as "<7ec4>". Term49 supplies
++ * t49_iswprint() (see tools/zsh-wcwidth.c) and uses it here. */
++#  undef iswprint
++int t49_iswprint(wint_t);
++#  define WC_ISPRINT(X)	t49_iswprint(X)
+ # endif
+ #else
+ #define WC_ZISTYPE(X,Y)	zistype((X),(Y))

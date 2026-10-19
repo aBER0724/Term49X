@@ -5,6 +5,7 @@
 # Usage (from the repo root):
 #   ./scripts/docker-build.sh            # build Term49 binary + unsigned bar
 #   ./scripts/docker-build.sh sdl        # also rebuild external/lib/libSDL12.so
+#   ./scripts/docker-build.sh zsh        # also rebuild share/root/bin/zsh
 #
 # Uses the community image uvatbc/bbndk (BB10 NDK 10.3.1.995 preinstalled).
 # On arm64 hosts (Apple silicon) the image runs under x86 emulation, which
@@ -13,7 +14,7 @@
 
 set -e
 
-IMAGE="${BBNDK_IMAGE:-uvatbc/bbndk:latest}"
+IMAGE="${BBNDK_IMAGE:-delaya73/bbndk:latest}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Pre-stage the terminfo tree from git on the host: the container only

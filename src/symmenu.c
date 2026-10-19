@@ -36,6 +36,34 @@ static int symkey_label(const char *to, char *out, size_t outsz) {
 	}
 	size_t n = strlen(to);
 
+	/* Term49 menu actions (see handle_menu_action in main.c) */
+	{
+		const char *sym = NULL;
+		/* short, same-width-ish labels so the grid reads evenly */
+		if      (!strcmp(to, "paste_clipboard")) sym = "Paste";
+		else if (!strcmp(to, "pinyin_toggle"))   sym = "CN";
+		else if (!strcmp(to, "vkb_toggle"))      sym = "Kbd";
+		else if (!strcmp(to, "rescreen"))        sym = "Fix";
+		else if (!strcmp(to, "clear_screen"))    sym = "Cls";
+		else if (!strcmp(to, "menu_close"))      sym = "Close";
+		else if (!strcmp(to, "lang_toggle"))     sym = "Lang";
+		else if (!strcmp(to, "pinyin_full"))     sym = "Full";
+		else if (!strcmp(to, "session_new"))     sym = "New";
+		else if (!strcmp(to, "session_menu"))    sym = "List";
+		else if (!strcmp(to, "session_search"))  sym = "Find";
+		else if (!strcmp(to, "session_close"))   sym = "Kill";
+		else if (!strcmp(to, "session_rename"))  sym = "Name";
+		else if (!strcmp(to, "session_bar"))     sym = "Bar";
+		else if (!strcmp(to, "screenshot"))      sym = "Shot";
+		else if (!strcmp(to, "dump_grid"))       sym = "Grid";
+		else if (!strcmp(to, "session_new_utf8")) sym = "UTF8";
+		else if (!strcmp(to, "session_new_zsh"))  sym = "Zsh";
+		if (sym != NULL) {
+			snprintf(out, outsz, "%s", sym);
+			return 1;
+		}
+	}
+
 	/* terminfo key names (cf. is_terminfo_keystrokes in main.c) */
 	if (to[0] == 'k') {
 		const char *sym = NULL;
@@ -131,14 +159,19 @@ static UChar symbol_alternate(UChar c) {
 }
 
 void destroy_symmenu(symmenu_t *menu) {
-	for (symkey_t **row = menu->keys; row != NULL; ++row) {
+	if (menu == NULL) {
+		return;
+	}
+	/* keys[i] point *into* the row array, so only the row is freed; the
+	 * old code freed the interior pointers as well (and walked past the
+	 * NULL sentinel), which turns every exit into an abort() in free(). */
+	for (symkey_t **row = menu->keys; row != NULL && *row != NULL; ++row) {
 		for (symkey_t *key = *row; key->map != NULL; ++key) {
 			free(key->uc);
-			free(key);
 		}
-		free(row);
+		free(*row);
 	}
-	
+	free(menu->keys);
 	free(menu->entries);
 	SDL_FreeSurface(menu->surface);
 }
@@ -204,6 +237,56 @@ SDL_Surface *render_symmenu(SDL_Surface *screen, pref_t *prefs, symmenu_t *menu)
 	SDL_FreeSurface(testsurf);
 	int screen_width = atoi(getenv("WIDTH"));
 	int bg_w = screen_width / longest_row_len;
+
+	/* One label size for the whole menu: start at the normal size and step
+	 * down until the widest label fits its key, so every key reads at the
+	 * same size instead of each long label being shrunk on its own. */
+	{
+		int fit_size = fg_font_size;
+		int avail = bg_w - 2 * SYMKEY_BORDER_SIZE - 4;
+		while (fit_size > 8) {
+			int widest = 0;
+			TTF_Font *probe = TTF_OpenFont(prefs->font_path, fit_size);
+			if (probe == NULL) {
+				break;
+			}
+			for (int r = 0; menu->keys[r] != NULL; ++r) {
+				for (int c = 0; menu->keys[r][c].map != NULL; ++c) {
+					char lb[64];
+					const char *src = symkey_label(menu->keys[r][c].map->to, lb, sizeof(lb))
+					                  ? lb : menu->keys[r][c].map->to;
+					int w = 0, h = 0;
+					if (TTF_SizeUTF8(probe, src, &w, &h) == 0 && w > widest) {
+						widest = w;
+					}
+				}
+			}
+			TTF_CloseFont(probe);
+			if (widest <= avail) {
+				break;
+			}
+			fit_size -= 2;
+		}
+		if (fit_size != fg_font_size) {
+			TTF_CloseFont(fg_font);
+			fg_font_size = fit_size;
+			fg_font = TTF_OpenFont(prefs->font_path, fg_font_size);
+			TTF_SetFontStyle(fg_font, TTF_STYLE_NORMAL);
+			TTF_SetFontOutline(fg_font, 0);
+			TTF_SetFontKerning(fg_font, 0);
+			TTF_SetFontHinting(fg_font, TTF_HINTING_NORMAL);
+			if (fg_fallback != NULL) {
+				TTF_CloseFont(fg_fallback);
+				fg_fallback = TTF_OpenFont(prefs->fallback_font_path, fg_font_size);
+				if (fg_fallback != NULL) {
+					TTF_SetFontStyle(fg_fallback, TTF_STYLE_NORMAL);
+					TTF_SetFontOutline(fg_fallback, 0);
+					TTF_SetFontKerning(fg_fallback, 0);
+					TTF_SetFontHinting(fg_fallback, TTF_HINTING_NORMAL);
+				}
+			}
+		}
+	}
 	
 	/* fill in the symkey entries from prefs keymap*/
 	for (int row = 0; menu->keys[row] != NULL; ++row) {
@@ -335,29 +418,13 @@ SDL_Surface *render_symmenu(SDL_Surface *screen, pref_t *prefs, symmenu_t *menu)
 			destrect.y = sk->hitbox.y - (screen->h - num_rows * bg_h) + SYMKEY_BORDER_SIZE + SYMMENU_FRET_SIZE;
 			SDL_Surface *destsurf = TTF_RenderUNICODE_Shaded(label_font, labelbuf, (SDL_Color)SYMMENU_FONT, (SDL_Color)SYMMENU_BACKGROUND);
 
-			/* shrink a multi-character label that would overflow the key */
-			int avail_w = bg_w - 2 * SYMKEY_BORDER_SIZE;
-			if (destsurf != NULL && avail_w > 0 && destsurf->w > avail_w) {
-				int shrunk = (fg_font_size * avail_w) / destsurf->w;
-				if (shrunk < 6) shrunk = 6;
-				TTF_Font *sfont = TTF_OpenFont(
-				    (label_font == fg_fallback) ? prefs->fallback_font_path : prefs->font_path,
-				    shrunk);
-				if (sfont != NULL) {
-					TTF_SetFontStyle(sfont, TTF_STYLE_NORMAL);
-					TTF_SetFontOutline(sfont, 0);
-					TTF_SetFontKerning(sfont, 0);
-					TTF_SetFontHinting(sfont, TTF_HINTING_NORMAL);
-					SDL_Surface *s2 = TTF_RenderUNICODE_Shaded(sfont, labelbuf, (SDL_Color)SYMMENU_FONT, (SDL_Color)SYMMENU_BACKGROUND);
-					if (s2 != NULL) {
-						SDL_FreeSurface(destsurf);
-						destsurf = s2;
-					}
-					TTF_CloseFont(sfont);
-				}
-			}
-
 			if (destsurf != NULL) {
+				/* centre the label in its key (below the fret) */
+				int key_top = sk->hitbox.y - (screen->h - num_rows * bg_h) + SYMMENU_FRET_SIZE;
+				int key_h = bg_h - SYMMENU_FRET_SIZE;
+				destrect.x = sk->hitbox.x + (bg_w - destsurf->w) / 2;
+				destrect.y = key_top + (key_h - destsurf->h) / 2;
+				if (destrect.x < sk->hitbox.x) destrect.x = sk->hitbox.x;
 				destrect.w = destsurf->w;
 				destrect.h = destsurf->h;
 				if (SDL_BlitSurface(destsurf, NULL, menu_surface, &destrect) != 0){

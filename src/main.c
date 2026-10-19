@@ -18,6 +18,8 @@
 #include <unix.h>
 #include <termios.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <string.h>
 #include <stdlib.h>
 #include <time.h>
 #include <sched.h>
@@ -28,6 +30,7 @@
 #include <bps/virtualkeyboard.h>
 #include <bps/deviceinfo.h>
 #include <unicode/utf.h>
+#include <unicode/ustring.h>
 
 #include "SDL.h"
 #include "SDL_ttf.h"
@@ -38,20 +41,25 @@
 #include "terminal.h"
 #include "ecma48.h"
 #include "preferences.h"
+#include "pinyin.h"
 #include "buffer.h"
 #include "io.h"
 #include "colors.h"
 
+#include "session.h"
+#include "sessionui.h"
+
 static int exit_application = 0;
 
-static char slave_ptyname[L_ctermid];
+void indicate_event_input();
+
+/* top edge of the terminal grid in pixels: the session tab bar owns the
+ * strip above it (0 when the bar is hidden) */
+int content_top = 0;
 
 static int cursor_x = 0;
 static int cursor_y = 0;
 char draw_cursor = 1;
-/* DECSCUSR cursor style: 0/1/2 block, 3/4 underline, 5/6 bar */
-int cursor_shape = 0;
-
 char flash = 0;
 
 static pref_t *prefs = NULL;
@@ -62,6 +70,8 @@ static char altsym_lock = 0;   /* one-shot: consumed by the next key */
 static char altsym_hold = 0;   /* persistent alt mode (menu key) */
 
 static char metamode = 0;
+/* terminal rows reserved at the bottom for the pinyin input bar */
+static int pinyin_bar_rows = 0;
 static int metamode_doubletap_key = 0;
 static struct timespec metamode_last;
 static SDL_Color metamode_cursor_fg = SDL_BLACK;
@@ -71,6 +81,9 @@ static int vmodifiers = 0;
 
 static TTF_Font* font;
 static TTF_Font* fallback_font;
+/* Symbols Nerd Font Mono: private-use glyphs (powerline, devicons, ...) that
+ * neither the terminal font nor the Cascadia fallback carries. */
+static TTF_Font* nerd_font;
 /* Chain of CJK faces tried in order for glyphs the fonts above lack. No single
  * BB10 face covers all of CJK: the Simplified Hei (GB18030) has Han but not
  * Japanese kana or Hangul, so extra faces are chained (MSung/cp950 for kana,
@@ -100,8 +113,6 @@ static SDL_Surface* altsym_indicator;
 static SDL_Surface* scroll_indicator;
 SDL_Surface* blank_surface;
 
-static pid_t child_pid = -1;
-
 static char virtualkeyboard_visible = 0;
 static char key_repeat_done = 0;
 
@@ -111,6 +122,10 @@ static int event_pipe[2];
 
 /* leftover touch-drag pixels not yet turned into scrolled lines */
 static int touch_scroll_acc = 0;
+/* touch bookkeeping for tap-to-open-URL and bar swipes */
+static int touch_down_ticks = 0;
+static int touch_down_x = 0, touch_down_y = 0;
+
 /* a touch drag is currently extending a text selection */
 static char touch_selecting = 0;
 
@@ -247,6 +262,213 @@ void altsym_hold_toggle() {
 	altsym_hold = altsym_hold ? 0 : 1;
 }
 
+/* ---- Menu-key action popup ------------------------------------------
+ * The Menu (BlackBerry) key opens a small action grid: paste, toggle the
+ * pinyin bar, toggle the virtual keyboard, clear the screen, rescreen.
+ * Actions that change the screen layout have to run *after* the popup is
+ * dismissed (closing it resizes the screen), hence menu_pending_*.
+ * TERM49_MENU_ALT=1 restores the old behaviour (Menu = sticky Alt).
+ */
+static int menu_pending_vkb = 0;
+static int menu_pending_clear = 0;
+static int menu_pending_bar = 0;
+static void pinyin_set_bar(int on);
+
+static void menu_log(const char *what) {
+	const char *home = getenv("HOME");
+	char path[512];
+	FILE *fp;
+
+	if (home == NULL) {
+		return;
+	}
+	snprintf(path, sizeof(path), "%s/.term49_keys.log", home);
+	fp = fopen(path, "a");
+	if (fp == NULL) {
+		return;
+	}
+	fprintf(fp, "action=%s vkb_visible=%d\n", what, (int)virtualkeyboard_visible);
+	fclose(fp);
+}
+
+/* Dump the visible grid: one line per row, each cell as its code point plus
+ * the wide/combining flags. This is the ground truth for rendering bugs -
+ * it says whether the program sent garbage or the renderer drew it wrong. */
+static void dump_grid(void) {
+	char path[512];
+	const char *home = getenv("HOME");
+	FILE *fp;
+	int r, c;
+
+	if (home == NULL) { return; }
+	snprintf(path, sizeof(path), "%s/grid.txt", home);
+	fp = fopen(path, "w");
+	if (fp == NULL) { return; }
+	fprintf(fp, "rows=%d cols=%d line=%d top=%d view=%d\n",
+	        rows, cols, buf->line, buf->top_line, buf->view_offset);
+	for (r = 0; r < rows; ++r) {
+		int line = buf->top_line + r;
+		fprintf(fp, "%03d|", r);
+		for (c = 0; c < cols; ++c) {
+			struct screenchar *sc;
+			if (line < 0 || line >= TEXT_BUFFER_SIZE) { fputs(" ....", fp); continue; }
+			sc = &buf->text[line][c];
+			fprintf(fp, " %04X%s", (unsigned)sc->c,
+			        sc->wide == 2 ? "w" : (sc->wide ? "W" : (sc->c ? " " : "_")));
+			if (sc->c2) { fprintf(fp, "+%04X", (unsigned)sc->c2); }
+			else { fputs("    ", fp); }
+		}
+		fputc('\n', fp);
+	}
+	fclose(fp);
+}
+
+/* Save the frame for off-device inspection (Menu -> shot) */
+int screenshot_save(SDL_Surface *s, const char *path);
+
+static void take_screenshot(void) {
+	char path[512];
+	const char *home = getenv("HOME");
+	if (home == NULL) { return; }
+	snprintf(path, sizeof(path), "%s/shot.bmp", home);
+	if (screenshot_save(screen, path) == 0) {
+		menu_log("screenshot saved");
+	} else {
+		menu_log("screenshot failed");
+	}
+}
+
+
+/* Toggle the system input language (pinyin <-> english) by rewriting the
+ * input service's options object.  The App cannot write /pps/services/input
+ * itself, but the rooted OS ships /base/bin/__input_service (setuid
+ * input_service) which runs a shell script fed on stdin.
+ */
+static void switch_input_language(void) {
+	const char *home = getenv("HOME");
+	char dir[512], sh_path[512], state_path[512];
+	char line[64], cmd[1200];
+	FILE *fp;
+	int currently_pinyin = 0;
+
+	if (home == NULL) {
+		return;
+	}
+	snprintf(dir, sizeof(dir), "%s/tmp", home);
+	mkdir(dir, 0755);
+	snprintf(state_path, sizeof(state_path), "%s/term49_lang.state", dir);
+	snprintf(sh_path, sizeof(sh_path), "%s/term49_lang.sh", dir);
+
+	/* our own record of the last language we applied */
+	fp = fopen(state_path, "r");
+	if (fp != NULL) {
+		if (fgets(line, sizeof(line), fp) != NULL && strstr(line, "pinyin") != NULL) {
+			currently_pinyin = 1;
+		}
+		fclose(fp);
+	}
+
+	/* the payload is embedded in the script itself: the setuid wrapper runs
+	 * as input_service, which cannot read files under our app data dir */
+	fp = fopen(sh_path, "w");
+	if (fp == NULL) {
+		return;
+	}
+	if (currently_pinyin) {
+		fprintf(fp, "cat > /pps/services/input/options <<'PPS'\n");
+		fprintf(fp, "@options\n");
+		fprintf(fp, "languages.default_lang_layout:json:{\"layout_id\":\"QWERTY\",\"layout_text\":\"QWERTY\",\"locale\":\"en_US\"}\n");
+		fprintf(fp, "languages.active_lang_layouts:json:{\"layout_id\":\"qwerty\",\"locales\":[\"en_US\"]}\n");
+		fprintf(fp, "layout_configurations:json:[{\"layout_id\":\"qwerty\",\"locale\":\"en_US\"},{\"layout_id\":\"pinyin_qwerty\",\"locale\":\"zh_CN_Pinyin\"}]\n");
+		fprintf(fp, "PPS\n");
+	} else {
+		fprintf(fp, "cat > /pps/services/input/options <<'PPS'\n");
+		fprintf(fp, "@options\n");
+		fprintf(fp, "languages.additional_lang_layouts:json:[{\"layout_id\":\"拼音\",\"layout_text\":\"拼音\",\"locale\":\"zh_CN_Pinyin\"}]\n");
+		fprintf(fp, "languages.default_lang_layout:json:{\"layout_id\":\"拼音\",\"layout_text\":\"拼音\",\"locale\":\"zh_CN_Pinyin\"}\n");
+		fprintf(fp, "languages.active_lang_layouts:json:{\"layout_id\":\"pinyin_qwerty\",\"locales\":[\"zh_CN_Pinyin\"]}\n");
+		fprintf(fp, "layout_configurations:json:[{\"layout_id\":\"pinyin_qwerty\",\"locale\":\"zh_CN_Pinyin\"},{\"layout_id\":\"qwerty\",\"locale\":\"en_US\"}]\n");
+		fprintf(fp, "PPS\n");
+	}
+	fclose(fp);
+
+	snprintf(cmd, sizeof(cmd), "/bin/sh -c '/base/bin/__input_service < %s'", sh_path);
+	system(cmd);
+
+	fp = fopen(state_path, "w");
+	if (fp != NULL) {
+		fprintf(fp, currently_pinyin ? "en\n" : "pinyin\n");
+		fclose(fp);
+	}
+	menu_log(currently_pinyin ? "lang->en" : "lang->pinyin");
+}
+
+/* Menu-key popup actions. Returns 1 when the entry was an action (and was
+ * executed or queued), 0 when it is an ordinary keystroke sequence. */
+static int handle_menu_action(const char *keys) {
+	if (keys == NULL) {
+		return 0;
+	}
+	if (0 == strncmp(keys, "paste_clipboard", 15)) {
+		menu_log("paste_clipboard");
+		io_paste_from_clipboard();
+		return 1;
+	}
+	if (0 == strncmp(keys, "rescreen", 8)) {
+		rescreen(-1, -1);
+		return 1;
+	}
+	if (0 == strncmp(keys, "menu_close", 10)) {
+		return 1; /* closing happens in the caller */
+	}
+	if (0 == strncmp(keys, "screenshot", 10)) {
+		take_screenshot();
+		return 1;
+	}
+	if (0 == strncmp(keys, "dump_grid", 9)) {
+		dump_grid();
+		menu_log("grid dumped");
+		return 1;
+	}
+	if (0 == strncmp(keys, "pinyin_full", 11)) {
+		pinyin_set_full(!pinyin_full());
+		menu_log(pinyin_full() ? "pinyin full" : "pinyin xiaohe");
+		return 1;
+	}
+	if (0 == strncmp(keys, "pinyin_toggle", 13)) {
+		pinyin_toggle();
+		menu_log(pinyin_enabled() ? "pinyin on" : "pinyin off");
+		menu_pending_bar = 1;
+		return 1;
+	}
+	if (0 == strncmp(keys, "lang_toggle", 11)) {
+		switch_input_language();
+		return 1;
+	}
+	if (0 == strncmp(keys, "vkb_toggle", 10)) {
+		menu_log("vkb_toggle(queued)");
+		menu_pending_vkb = 1;
+		return 1;
+	}
+	if (0 == strncmp(keys, "clear_screen", 12)) {
+		menu_log("clear_screen(queued)");
+		menu_pending_clear = 1;
+		return 1;
+	}
+	/* session actions, so they can sit in the same menu */
+	if (0 == strncmp(keys, "session_new_zsh", 15))  { session_create_ex(1, SHELL_ZSH); return 1; }
+	if (0 == strncmp(keys, "session_new_utf8", 16)) { session_create_ex(1, SHELL_MKSH_UTF8); return 1; }
+	if (0 == strncmp(keys, "session_new", 11))       { sessionui_new_session(); return 1; }
+	if (0 == strncmp(keys, "session_next", 12))      { session_next(); return 1; }
+	if (0 == strncmp(keys, "session_prev", 12))      { session_prev(); return 1; }
+	if (0 == strncmp(keys, "session_close", 13))     { sessionui_close_active(); return 1; }
+	if (0 == strncmp(keys, "session_rename", 14))    { sessionui_start_rename(); return 1; }
+	if (0 == strncmp(keys, "session_search", 14))    { sessionui_start_search(); return 1; }
+	if (0 == strncmp(keys, "session_menu", 12))      { sessionui_open_switcher(); return 1; }
+	if (0 == strncmp(keys, "session_bar", 11))       { sessionui_toggle_bar(); return 1; }
+	return 0;
+}
+
 void symmenu_stick(){
 	PRINT(stderr, "Sticking Sym key\n");
 	symmenu_lock = 1;
@@ -269,6 +491,24 @@ void symmenu_toggle(symmenu_t *target){
 			setup_screen_size(screen->w, screen->h);
 		}
 		symmenu_lock = 0;
+		/* deferred menu actions: run now that the screen is back to full size */
+		if (menu_pending_vkb) {
+			menu_pending_vkb = 0;
+			if (virtualkeyboard_visible) {
+				virtualkeyboard_hide();
+			} else {
+				virtualkeyboard_show();
+			}
+		}
+		if (menu_pending_bar) {
+			menu_pending_bar = 0;
+			pinyin_set_bar(pinyin_enabled());
+		}
+		if (menu_pending_clear) {
+			menu_pending_clear = 0;
+			io_write_master_char("\033[2J\033[H", 7);
+			buf_reset_view();
+		}
 	}
 }
 
@@ -424,9 +664,27 @@ int font_init(int font_size){
 	text_height += text_height_padding;
 	PRINT(stderr, "Character h: %d w:%d (h padding: %d) advance: %d\n", text_height, text_width, text_height_padding, advance);
 
+	/* the tab bar is drawn with the terminal font, so it has to know the
+	 * cell metrics before the grid is sized against it */
+	sessionui_set_metrics(text_height, advance);
+
 	/* Fallback font for glyphs the main font does not provide (box
 	 * drawing, braille, powerline, ...). Sized down until it fits the
 	 * cell width; height is left alone so box glyphs stay connected. */
+	nerd_font = NULL;
+	{
+		const char *nerd_path = "../app/native/fonts/SymbolsNerdFontMono-Regular.ttf";
+		nerd_font = TTF_OpenFont(nerd_path, font_size);
+		if(nerd_font == NULL){
+			fprintf(stderr, "No nerd font at %s: %s\n", nerd_path, SDL_GetError());
+		} else {
+			TTF_SetFontStyle(nerd_font, TTF_STYLE_NORMAL);
+			TTF_SetFontOutline(nerd_font, 0);
+			TTF_SetFontKerning(nerd_font, 0);
+			TTF_SetFontHinting(nerd_font, TTF_HINTING_NORMAL);
+		}
+	}
+
 	fallback_font = NULL;
 	if(prefs->fallback_font_path && prefs->fallback_font_path[0]){
 		int fb_size = font_size;
@@ -486,6 +744,11 @@ int font_init(int font_size){
 	return TERM_SUCCESS;
 }
 
+/* the terminal's primary font, for the session UI chrome */
+TTF_Font* app_font(){
+	return font;
+}
+
 /* pick the font that can actually draw this character */
 static TTF_Font* font_for_char(UChar c){
 	if(TTF_GlyphIsProvided(font, c)){
@@ -493,6 +756,9 @@ static TTF_Font* font_for_char(UChar c){
 	}
 	if(fallback_font != NULL && TTF_GlyphIsProvided(fallback_font, c)){
 		return fallback_font;
+	}
+	if(nerd_font != NULL && TTF_GlyphIsProvided(nerd_font, c)){
+		return nerd_font;
 	}
 	int i;
 	for(i = 0; i < num_cjk_fonts; ++i){
@@ -524,6 +790,7 @@ static TTF_Font* font_for_char(UChar c){
 struct glyph_entry {
 	SDL_Surface* surface;
 	UChar c;
+	UChar c2;          /* low surrogate or combining mark, 0 = none */
 	int style;
 	Uint32 fg, bg;
 	char used;
@@ -549,11 +816,14 @@ void glyph_cache_flush(){
  * *shared is 1 when the surface belongs to the cache - borrow it, never
  * free it. It is 0 only when the bucket is full, in which case the caller
  * owns the returned surface and must free it after drawing. */
-static SDL_Surface* glyph_render(UChar c, int style, SDL_Color fg, SDL_Color bg, int* shared){
-	UChar str[2] = {c, 0};
+static SDL_Surface* glyph_render(UChar c, UChar c2, int style, SDL_Color fg, SDL_Color bg, int* shared){
+	UChar str[3];
+	str[0] = c;
+	str[1] = c2;
+	str[2] = 0;
 	Uint32 pfg = pack_color(fg);
 	Uint32 pbg = pack_color(bg);
-	Uint32 h = ((Uint32)c * 2654435761u) ^ ((Uint32)style * 40503u)
+	Uint32 h = ((Uint32)c * 2654435761u) ^ ((Uint32)c2 * 12289u) ^ ((Uint32)style * 40503u)
 	           ^ (pfg * 2246822519u) ^ (pbg * 3266489917u);
 	int slot = (int)(h & (GLYPH_CACHE_SLOTS - 1));
 	int probe;
@@ -562,7 +832,7 @@ static SDL_Surface* glyph_render(UChar c, int style, SDL_Color fg, SDL_Color bg,
 	for(probe = 0; probe < GLYPH_CACHE_PROBES; ++probe){
 		struct glyph_entry* e = &glyph_cache[(slot + probe) & (GLYPH_CACHE_SLOTS - 1)];
 		if(e->used){
-			if(e->c == c && e->style == style && e->fg == pfg && e->bg == pbg){
+			if(e->c == c && e->c2 == c2 && e->style == style && e->fg == pfg && e->bg == pbg){
 				*shared = 1;
 				return e->surface;
 			}
@@ -577,6 +847,7 @@ static SDL_Surface* glyph_render(UChar c, int style, SDL_Color fg, SDL_Color bg,
 			return NULL;
 		}
 		e->c = c;
+		e->c2 = c2;
 		e->style = style;
 		e->fg = pfg;
 		e->bg = pbg;
@@ -607,6 +878,10 @@ void font_uninit(){
 		TTF_CloseFont(fallback_font);
 		fallback_font = NULL;
 	}
+	if(nerd_font != NULL){
+		TTF_CloseFont(nerd_font);
+		nerd_font = NULL;
+	}
 	SDL_FreeSurface(blank_surface);
 	SDL_FreeSurface(flash_surface);
 	SDL_FreeSurface(metamode_cursor);
@@ -629,11 +904,15 @@ void handle_activeevent(int gain, int state){
 }
 
 void handle_mousedown(Uint16 x, Uint16 y){
-	/* check for hits in the metamode_hitbox */
+	/* The metamode hitbox is measured from the top of the *grid*: the tab
+	 * bar owns the strip above it, so the corner gesture keeps working
+	 * without fighting the tabs. Symmenu hitboxes below are in screen
+	 * coordinates, since the menu is drawn on the window bottom. */
+	int gy = y - content_top;
 	if((x >= prefs->metamode_hitbox->x) &&
 	   (x <= prefs->metamode_hitbox->x + prefs->metamode_hitbox->w) &&
-	   (y >= prefs->metamode_hitbox->y) &&
-	   (y <= prefs->metamode_hitbox->y + prefs->metamode_hitbox->h)) {
+	   (gy >= prefs->metamode_hitbox->y) &&
+	   (gy <= prefs->metamode_hitbox->y + prefs->metamode_hitbox->h)) {
 		/* hit in the box */
 		metamode_toggle();
 	}
@@ -645,7 +924,10 @@ void handle_mousedown(Uint16 x, Uint16 y){
 
 	/* check for symmenu touches */
 	if(current_symmenu != NULL){
-		send_metamode_keystrokes(symkey_for_mousedown(current_symmenu, x, y));
+		const char *menu_key = symkey_for_mousedown(current_symmenu, x, y);
+		if (!handle_menu_action(menu_key)) {
+			send_metamode_keystrokes(menu_key);
+		}
 	}
 }
 
@@ -682,9 +964,11 @@ void rescreen(int w, int h){
 	int height = h == -1 ? screen->h : h;
 	int vkb_h = 0;
 	screen = SDL_SetVideoMode(width, height, PB_D_PIXELS, SDL_HWSURFACE | SDL_DOUBLEBUF);
+	sessionui_set_screen(screen);
 	/* reset the font size as well */
 	font_uninit();
 	buf_clear_all_renders();
+	session_clear_renders();
 	if(font_init(prefs->font_size) == TERM_FAILURE){
 		fprintf(stderr, "Couldn't initialize font\n");
 		exit_application = 1;
@@ -778,10 +1062,43 @@ static symmenu_t *get_keyhold_actions(int keycode) {
 /* Hardware belt keys (BlackBerry Classic). Called from the patched SDL
  * navigator event handler; return nonzero to claim the key from the OS.
  * The back button sends configurable keystrokes (Esc by default). */
+/* ---- built-in pinyin input bar ------------------------------------- */
+static FILE *term49_keylog_fp(void);
+
+static void pinyin_commit(const char *utf8, size_t len) {
+	ssize_t w = io_write_master_char(utf8, len);
+	FILE *fp = term49_keylog_fp();
+	if (fp != NULL) {
+		fprintf(fp, "commit len=%u wrote=%d master=%d text=[%.*s]\n",
+		        (unsigned)len, (int)w, io_get_master(), (int)len, utf8);
+		fflush(fp);
+	}
+	buf_reset_view();
+}
+
+/* reserve the bottom row for the input bar while it is on */
+static void pinyin_set_bar(int on) {
+	int want = on ? 1 : 0;
+	if (want != pinyin_bar_rows) {
+		pinyin_bar_rows = want;
+		rescreen(-1, -1);
+	}
+}
+
 int handleSyskeyEvent(int syskey)
 {
 	switch(syskey){
 	case NAVIGATOR_SYSKEY_BACK:
+		/* while a prompt / search / switcher is up, Back means "cancel" */
+		if(sessionui_cancel()){
+			return 1;
+		}
+		/* then an unfinished pinyin composition */
+		if (pinyin_composing()) {
+			pinyin_key(0x1b, pinyin_commit);
+			indicate_event_input();
+			return 1;
+		}
 		send_metamode_keystrokes(prefs->back_button_keys);
 		return 1;
 	default:
@@ -815,6 +1132,35 @@ void handleTrackpadEvent(screen_event_t screen_event)
 
 	screen_get_event_property_iv(screen_event, SCREEN_PROPERTY_DISPLACEMENT, displacement);
 	screen_get_event_property_iv(screen_event, SCREEN_PROPERTY_BUTTONS, &buttons);
+
+	if(sessionui_modal()){
+		/* the prompt / search / switcher owns input: swipe moves through
+		 * it, click confirms - nothing goes to the shell */
+		int click = buttons && !trackpad_buttons;
+		trackpad_buttons = buttons;
+		trackpad_acc[0] += displacement[0];
+		trackpad_acc[1] += displacement[1];
+		threshold = prefs->trackpad_sensitivity > 0 ? prefs->trackpad_sensitivity : DEFAULT_TRACKPAD_SENSITIVITY;
+		if(click){
+			trackpad_acc[0] = trackpad_acc[1] = 0;
+			sessionui_key(KEYCODE_RETURN, 0, 0);
+			return;
+		}
+		if(displacement[0] == 0 && displacement[1] == 0){
+			return;
+		}
+		if(abs(trackpad_acc[1]) >= threshold){
+			int key = trackpad_acc[1] < 0 ? KEYCODE_UP : KEYCODE_DOWN;
+			trackpad_acc[1] = 0;
+			sessionui_key(key, 0, 0);
+		}
+		if(abs(trackpad_acc[0]) >= threshold){
+			int key = trackpad_acc[0] < 0 ? KEYCODE_LEFT : KEYCODE_RIGHT;
+			trackpad_acc[0] = 0;
+			sessionui_key(key, 0, 0);
+		}
+		return;
+	}
 
 	threshold = prefs->trackpad_sensitivity > 0 ? prefs->trackpad_sensitivity : DEFAULT_TRACKPAD_SENSITIVITY;
 
@@ -911,6 +1257,100 @@ void handleTrackpadEvent(screen_event_t screen_event)
 	}
 }
 
+/* --- IME diagnostics ---------------------------------------------------
+ * Log non-ASCII and control key events to $HOME/.term49_keys.log so the
+ * virtual keyboard / input method path can be inspected on device.
+ */
+static FILE *term49_keylog_fp(void)
+{
+	const char *home = getenv("HOME");
+	static FILE *fp = NULL;
+	static int checked = 0;
+	char path[512];
+
+	if (!checked) {
+		checked = 1;
+		if (home != NULL) {
+			snprintf(path, sizeof(path), "%s/.term49_keys.log", home);
+			fp = fopen(path, "a");
+		}
+	}
+	return fp;
+}
+
+static void term49_ime_log(int sym, int flags, int mods)
+{
+	FILE *fp = term49_keylog_fp();
+	if (fp == NULL) {
+		return;
+	}
+	fprintf(fp, "sym=0x%04x (%d) flags=0x%x mods=%d\n", sym, sym, (unsigned)flags, mods);
+	fflush(fp);
+}
+
+/* Every write to the pty, as hex plus a printable rendering. Together with
+ * the gate/pkey/commit lines this shows exactly what the shell received. */
+void io_trace_write(const char *buf, size_t len, ssize_t wrote)
+{
+	FILE *fp;
+	size_t i;
+	const char *e = getenv("TERM49_KEYLOG");
+	if (e != NULL && strcmp(e, "0") == 0) {
+		return;
+	}
+	fp = term49_keylog_fp();
+	if (fp == NULL) {
+		return;
+	}
+	fprintf(fp, "write len=%u wrote=%d master=%d hex=", (unsigned)len, (int)wrote, io_get_master());
+	for (i = 0; i < len && i < 48; ++i) {
+		fprintf(fp, "%02x", (unsigned char)buf[i]);
+	}
+	fprintf(fp, " txt=[");
+	for (i = 0; i < len && i < 48; ++i) {
+		unsigned char c = (unsigned char)buf[i];
+		if (c == 0x1b) fputs("\\e", fp);
+		else if (c == 0x7f) fputs("<DEL>", fp);
+		else if (c == '\r') fputs("\\r", fp);
+		else if (c < 0x20) fprintf(fp, "^%c", c + '@');
+		else fputc(c, fp);
+	}
+	fputs("]\n", fp);
+	fflush(fp);
+}
+
+/* Trace for the input methods: which key arrived, what the routing gate
+ * decided, and what pinyin did with it. */
+static void term49_pinyin_log(int sym, int flags, int mods, int pk,
+                              int composing, int gate, int rc)
+{
+	static int enabled = -1;
+	FILE *fp;
+	if (enabled < 0) {
+		const char *e = getenv("TERM49_KEYLOG");
+		enabled = !(e != NULL && strcmp(e, "0") == 0);
+	}
+	if (!enabled) {
+		return;
+	}
+	fp = term49_keylog_fp();
+	if (fp == NULL) {
+		return;
+	}
+	/* keep the trace small: start over past 256 KB */
+	if (ftell(fp) > 256 * 1024) {
+		ftruncate(fileno(fp), 0);
+		rewind(fp);
+	}
+	{
+		char st[256];
+		pinyin_status(st, sizeof(st));
+		fprintf(fp, "pkey sym=0x%04x flags=0x%x mods=%d pk=%d composing=%d gate=%d rc=%d bar=[%s]\n",
+		        (unsigned)sym, (unsigned)flags, mods, pk, composing, gate, rc, st);
+	}
+	fflush(fp);
+}
+
 void handleKeyboardEvent(screen_event_t screen_event)
 {
 	int screen_val, screen_flags, screen_alt_val;
@@ -926,7 +1366,7 @@ void handleKeyboardEvent(screen_event_t screen_event)
 	int32_t last_len = 0;
 	int32_t bs_i = 0;
 	size_t upcase_len = 0;
-	UChar backspace = 0x8;
+	UChar backspace = (UChar)ecma48_backspace();
 
 	screen_get_event_property_iv(screen_event, SCREEN_PROPERTY_KEY_FLAGS, &screen_flags);
 	screen_get_event_property_iv(screen_event, SCREEN_PROPERTY_KEY_SYM, &screen_val);
@@ -934,8 +1374,105 @@ void handleKeyboardEvent(screen_event_t screen_event)
 	screen_get_event_property_iv(screen_event, SCREEN_PROPERTY_KEY_MODIFIERS, &modifiers);
 	//screen_get_event_property_iv(screen_event, SCREEN_PROPERTY_KEY_CAP, &cap);
 
+	/* Built-in pinyin bar: plain letters, digits, space, enter, backspace
+	 * and , . go to the bar while it is on. Modifier/menu/metamode keys and
+	 * anything with ctrl/alt keep their usual meaning, and a rename prompt
+	 * or the search bar always sees the keyboard first. */
+	{
+		int composing = pinyin_composing();
+		/* On the Classic (Q20) there is no number row: digits, ',' '.' '-'
+		 * '=' live on the Alt layer, so those keys arrive with KEYMOD_ALT
+		 * and the sym already resolved to the digit. While a composition
+		 * is up they must still pick a candidate / turn the page instead
+		 * of being typed into the shell. Every other Alt combination (and
+		 * all of Ctrl) keeps its usual meaning. */
+		int alt = ((modifiers | vmodifiers) & KEYMOD_ALT) != 0;
+		int sticky_alt = altsym_lock || altsym_hold;
+		/* Digits and the paging keys are control characters for the bar, so
+		 * they win over Alt entirely while a composition is up. Off the
+		 * composition they keep their normal meaning (on the Classic they
+		 * *are* the Alt layer of the number keys). */
+		int ime_char = composing &&
+		               (((screen_val >= '1' && screen_val <= '9')) ||
+		                screen_val == ',' || screen_val == '.' ||
+		                screen_val == '-' || screen_val == '=');
+		int pinyin_gate = (screen_flags & KEY_DOWN) && pinyin_enabled() &&
+		                  !sessionui_modal() && !metamode && current_symmenu == NULL &&
+		                  !((modifiers | vmodifiers) & KEYMOD_CTRL) &&
+		                  (!alt || ime_char) &&
+		                  (!sticky_alt || ime_char);
+		if (pinyin_enabled() && (screen_flags & KEY_DOWN)) {
+			FILE *lf = term49_keylog_fp();
+			if (lf != NULL) {
+				fprintf(lf, "gate sym=0x%04x flags=0x%x mods=%d vmods=%d alt=%d sticky=%d lock=%d hold=%d "
+				        "meta=%d symmenu=%d modal=%d composing=%d ime_char=%d -> gate=%d\n",
+				        (unsigned)screen_val, (unsigned)screen_flags, modifiers, vmodifiers,
+				        alt, sticky_alt, (int)altsym_lock, (int)altsym_hold, (int)metamode,
+				        current_symmenu != NULL, sessionui_modal(), composing, ime_char, pinyin_gate);
+				fflush(lf);
+			}
+		}
+		if (pinyin_gate) {
+			int pk = -1;
+			int rc = 0;
+			if (screen_val == KEYCODE_BACKSPACE) {
+				pk = 0x7f;
+			} else if (screen_val == KEYCODE_RETURN) {
+				pk = '\r';
+			} else if (screen_val >= 0x20 && screen_val < 0x7f) {
+				pk = screen_val;
+			}
+			if (pk >= 0) {
+				/* Candidate digits are always taken, even on a repeat: a
+				 * lost digit here means the digit is typed into the shell
+				 * instead of picking a word. Other keys may repeat only
+				 * backspace; holding space is the metamode gesture. */
+				int is_digit = (pk >= '1' && pk <= '9');
+				if (!is_digit && (screen_flags & KEY_REPEAT) && pk != 0x7f) {
+					if (composing || (pk >= 'a' && pk <= 'z') || (pk >= 'A' && pk <= 'Z')) {
+						term49_pinyin_log(screen_val, screen_flags, modifiers, pk, composing, 1, -1);
+						return;
+					}
+				} else {
+					rc = pinyin_key(pk, pinyin_commit);
+					term49_pinyin_log(screen_val, screen_flags, modifiers, pk, composing, 1, rc);
+					if (rc) {
+						/* an Alt-layer key that the bar took also uses up
+						 * the one-shot sticky Alt */
+						if (altsym_lock) {
+							altsym_toggle();
+						}
+						buf_reset_view();
+						indicate_event_input();
+						return;
+					}
+				}
+			}
+		}
+	}
+
 	if (screen_flags & KEY_DOWN) {
 		PRINT(stderr, "The '%d' key was pressed (modifiers: %d) (char %c) (alt %d)\n", (int)screen_val, modifiers, (char)screen_val, (int)screen_alt_val);
+
+		/* a rename prompt or the scrollback search bar owns the keyboard
+		 * while it is up - nothing typed there may reach the shell */
+		if(sessionui_key(screen_val, modifiers, screen_flags)){
+			return;
+		}
+
+		/* BB10 hands composed characters (CJK, accented, symbols) from the
+		 * virtual keyboard to the app as Unicode codepoints in KEY_SYM.
+		 * Real keycodes live in the Unicode private use area, so
+		 * 0x80..0xDFFF is literal text: pass it straight to the pty. */
+		if (screen_val >= 0x80 && screen_val < 0xE000) {
+			UChar ime_text;
+			term49_ime_log(screen_val, screen_flags, modifiers);
+			ime_text = (UChar)screen_val;
+			io_write_master(&ime_text, 1);
+			buf_reset_view();
+			pointer_visible = 0;
+			return;
+		}
 		fflush(stdout);
 
 		/* typing snaps the view back to the live screen; the alt and menu
@@ -987,7 +1524,16 @@ void handleKeyboardEvent(screen_event_t screen_event)
 		 * truncated to 'g' and matched against the alt table */
 		if(screen_val == KEYCODE_MENU){
 			if(!(screen_flags & KEY_REPEAT)){
-				altsym_hold_toggle();
+				if (prefs->action_menu != NULL && getenv("TERM49_MENU_ALT") == NULL) {
+					/* Menu key pops the action menu (paste / pinyin / vkb / ...) */
+					if (current_symmenu != NULL) {
+						symmenu_toggle(NULL);
+					} else {
+						symmenu_toggle(prefs->action_menu);
+					}
+				} else {
+					altsym_hold_toggle();
+				}
 			}
 			return;
 		}
@@ -1089,6 +1635,41 @@ void handleKeyboardEvent(screen_event_t screen_event)
 				if(!f && (0 == strncmp(keys, "ctrl_down", 9)))         { toggle_vkeymod(KEYMOD_CTRL);f=1;}
 				if(!f && (0 == strncmp(keys, "rescreen", 8)))          { rescreen(-1, -1);f=1;}
 				if(!f && (0 == strncmp(keys, "paste_clipboard", 15)))  { io_paste_from_clipboard();f=1;}
+				if(!f && (0 == strncmp(keys, "session_new", 11)))      { sessionui_new_session();f=1;}
+				if(!f && (0 == strncmp(keys, "session_menu", 12)))     { sessionui_open_switcher();f=1;}
+				if(!f && (0 == strncmp(keys, "session_prev", 12)))     { session_prev();f=1;}
+				if(!f && (0 == strncmp(keys, "session_next", 12)))     { session_next();f=1;}
+				if(!f && (0 == strncmp(keys, "session_close", 13)))    { sessionui_close_active();f=1;}
+				if(!f && (0 == strncmp(keys, "session_rename", 14)))   { sessionui_start_rename();f=1;}
+				if(!f && (0 == strncmp(keys, "session_search", 14)))   { sessionui_start_search();f=1;}
+				if(!f && (0 == strncmp(keys, "session_bar", 11)))      { sessionui_toggle_bar();f=1;}
+			}
+			/* Session shortcuts: built in, so they also work with an old
+			 * ~/.term49rc that knows nothing about sessions. Checked last,
+			 * so the user's own metamode_keys/metamode_func_keys win. */
+			if(keys == NULL && screen_val >= 0x20){
+				int session_action = 0;
+				switch(screen_val){
+					case 'n': sessionui_new_session();   session_action = 1; break;
+					case 'b': sessionui_open_switcher(); session_action = 1; break;
+					case 'r': sessionui_start_rename();  session_action = 1; break;
+					case 'f': sessionui_start_search();  session_action = 1; break;
+					case ']': session_next();            session_action = 1; break;
+					case '[': session_prev();            session_action = 1; break;
+					case 'x': sessionui_close_active();  session_action = 1; break;
+					case '0': sessionui_toggle_bar();    session_action = 1; break;
+					default:
+						if(screen_val >= '1' && screen_val <= '9'){
+							session_switch_index(screen_val - '1');
+							session_action = 1;
+						}
+						break;
+				}
+				if(session_action){
+					metamode_toggle();
+					indicate_event_input();
+					return;
+				}
 			}
 			metamode_toggle();
 			return;
@@ -1113,7 +1694,10 @@ void handleKeyboardEvent(screen_event_t screen_event)
 			keys = shifted_keystrokes(keystroke_lookup((char)screen_val, current_symmenu->entries),
 			                          (modifiers & KEYMOD_SHIFT) || (vmodifiers & KEYMOD_SHIFT));
 			if (keys != NULL){
-				send_metamode_keystrokes(keys);
+				int is_action = handle_menu_action(keys);
+				if (!is_action) {
+					send_metamode_keystrokes(keys);
+				}
 				symmenu_toggle(NULL);
 				return;
 			}
@@ -1182,18 +1766,37 @@ void handleKeyboardEvent(screen_event_t screen_event)
 	}
 }
 
-void set_tty_window_size(){
-	if(tcsetsize(io_get_master(), rows, cols) < 0){
+/* Push the current grid size to one session's pty. Background sessions
+ * need this too: they keep their own window size, and a shell that is
+ * switched back to after a rotation must already agree with the grid. */
+void session_push_winsize(session_t *s){
+	if(s == NULL || s->master_fd < 0){ return; }
+	if(tcsetsize(s->master_fd, rows, cols) < 0){
 		PRINT(stderr, "ERROR: tcsetsize() returned <0 (%s). Did not set child pty window size. \n", strerror(errno));
 	}
-	/* and send SIGWINCH */
-	int pgrp;
-	if(ioctl(io_get_master(), TIOCGPGRP, &pgrp) != -1){
-		killpg(pgrp, SIGWINCH);
-	} else {
-		PRINT(stderr, "Could not get pgrp of tty: %s\n", strerror(errno));
-		/* and assume the pgrp is our own, because we're not allowed to set pgrp.. */
-		killpg(getpid(), SIGWINCH);
+}
+
+void session_push_winsize_all(){
+	int i;
+	for(i = 0; i < session_count; ++i){
+		session_push_winsize(sessions[i]);
+	}
+}
+
+void set_tty_window_size(){
+	int i;
+	session_push_winsize_all();
+	/* and send SIGWINCH to every child */
+	for(i = 0; i < session_count; ++i){
+		session_t *s = sessions[i];
+		int pgrp;
+		if(s->master_fd < 0){ continue; }
+		if(ioctl(s->master_fd, TIOCGPGRP, &pgrp) != -1){
+			killpg(pgrp, SIGWINCH);
+		} else {
+			PRINT(stderr, "Could not get pgrp of tty: %s\n", strerror(errno));
+			killpg(getpid(), SIGWINCH);
+		}
 	}
 }
 
@@ -1208,9 +1811,19 @@ void setup_screen_size(int s_w, int s_h){
 	/* resizing works on the live screen */
 	buf_reset_view();
 
+	/* the session bar owns the top strip of the screen; the grid lives
+	 * below it so no terminal line is ever hidden by the chrome */
+	int bar = sessionui_bar_height();
+	int avail_h = s_h - bar;
+	if(avail_h < text_height){ avail_h = text_height; }
+	content_top = bar;
+
 	int old_rows = rows;
 	int old_bottom_line = buf_bottom_line();
-	rows = s_h / text_height;
+	rows = avail_h / text_height - pinyin_bar_rows;
+	if (rows < 1) {
+		rows = 1;
+	}
 	cols = s_w / text_width;
 	int diff_rows = rows - old_rows;
 	PRINT(stderr, "Rows: %d Cols: %d\n", rows, cols);
@@ -1305,6 +1918,7 @@ void set_screen_cols(int ncols){
 		int new_fontsize = preferences_guess_best_font_size(prefs, ncols);
 		font_uninit();
 		buf_clear_all_renders();
+		session_clear_renders();
 		if(font_init(new_fontsize) == TERM_FAILURE){
 			fprintf(stderr, "Error setting new font size\n");
 			exit_application = 1;
@@ -1389,6 +2003,7 @@ static int sdl_init() {
 	}
 
 	screen = SDL_SetVideoMode(wm_size[0], wm_size[1], PB_D_PIXELS, SDL_HWSURFACE | SDL_DOUBLEBUF);
+	sessionui_set_screen(screen);
 	if ( screen == NULL ) {
 		PRINT(stderr, "Couldn't set %d x %d x %d video mode: %s\n", wm_size[0], wm_size[1], PB_D_PIXELS, SDL_GetError());
 		TTF_Quit();
@@ -1413,37 +2028,44 @@ static int sdl_init() {
 	TEXT_BUFFER_SIZE = MAX_ROWS * 2 + (prefs->scrollback_lines > 0 ? prefs->scrollback_lines : 0);
 	fprintf(stderr, "Allocating %d rows and %d cols\n",TEXT_BUFFER_SIZE, MAX_COLS);
 
-	/* initialize the number of rows and columns */
-	rows = screen->h / text_height;
+	/* initialize the number of rows and columns (the grid sits below the
+	 * session bar) */
+	content_top = sessionui_bar_height();
+	rows = (screen->h - content_top) / text_height;
 	cols = screen->w / text_width;
 
-	if(buf_init() == TERM_FAILURE){
-		PRINT(stderr, "Couldn't initialize font\n");
-		TTF_Quit();
-		SDL_Quit();
-		return TERM_FAILURE;
+	/* Bring up the first terminal. Its buffers become the live engine
+	 * state, and its shell is forked with the geometry just computed. */
+	session_subsys_init();
+	{
+		session_t *first = session_create(0);
+		if(first == NULL){
+			PRINT(stderr, "Couldn't create the first session\n");
+			TTF_Quit();
+			SDL_Quit();
+			return TERM_FAILURE;
+		}
+		cur_session = first;
+		session_load_live(first);
+		io_set_master(first->master_fd);
 	}
 
 	setup_screen_size(screen->w, screen->h);
-	
+
 	/* and set the last 'press' */
 	clock_gettime(CLOCK_MONOTONIC, &metamode_last);
-
-	ecma48_init();
 
 	return TERM_SUCCESS;
 }
 
 void uninit(){
 
-	buf_uninit();
+	session_shutdown();
 
 	SDL_DestroyMutex(input_mutex);
 
 	font_uninit();
 	SDL_FreeSurface(screen);
-
-	ecma48_uninit();
 
 	TTF_Quit();
 	SDL_Quit();
@@ -1451,6 +2073,16 @@ void uninit(){
 	destroy_preferences(prefs);
 
 	io_uninit();
+}
+
+/* SGR 2: half intensity, approximated by blending towards the background */
+static SDL_Color dim_color(SDL_Color fg, SDL_Color bg){
+	SDL_Color out;
+	out.r = (Uint8)(((int)fg.r + bg.r) / 2);
+	out.g = (Uint8)(((int)fg.g + bg.g) / 2);
+	out.b = (Uint8)(((int)fg.b + bg.b) / 2);
+	out.unused = 0;
+	return out;
 }
 
 SDL_Color adjust_color(SDL_Color in, struct font_style sty){
@@ -1528,6 +2160,9 @@ static UChar* selection_to_text(int* out_len){
 			}
 			UChar c = buf->text[row][col].c;
 			text[n++] = (c == 0) ? ' ' : c;
+			if(buf->text[row][col].c2 != 0){
+				text[n++] = buf->text[row][col].c2;
+			}
 		}
 		if(row != r2){
 			text[n++] = '\n';
@@ -1542,8 +2177,9 @@ void render() {
 	int offset;
 	struct screenchar* sc;
 	SDL_Surface* torender;
-	UChar str[2];
-	str[1] = NULL;
+	UChar str[3];
+	str[1] = 0;
+	str[2] = 0;
 
 	/* Set the background */
 	SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, default_bg_color.r, default_bg_color.g, default_bg_color.b));
@@ -1554,7 +2190,7 @@ void render() {
 
 	for(int i = 0; i < rows; ++i){
 		float x = 0.0;
-		float y = text_height * (i);
+		float y = content_top + text_height * (i);
 		int bufline = i + view_top;
 
 		for(int j = 0; j < cols; ++j){
@@ -1578,12 +2214,17 @@ void render() {
 				// we have added a new char, but not rendered it yet
 				int shared = 1;
 				SDL_Surface* glyph;
+				SDL_Color fg = sc->style.fg_color;
+				SDL_Color bg = sc->style.bg_color;
+				if(sc->style.dim){
+					fg = dim_color(fg, bg);
+				}
 				if(buf->inverse_video){
-					glyph = glyph_render(sc->c, sc->style.style,
-					        adjust_color(sc->style.bg_color, sc->style), sc->style.fg_color, &shared);
+					glyph = glyph_render(sc->c, sc->c2, sc->style.style,
+					        adjust_color(bg, sc->style), fg, &shared);
 				} else {
-					glyph = glyph_render(sc->c, sc->style.style,
-					        adjust_color(sc->style.fg_color, sc->style), sc->style.bg_color, &shared);
+					glyph = glyph_render(sc->c, sc->c2, sc->style.style,
+					        adjust_color(fg, sc->style), bg, &shared);
 				}
 				if(glyph == NULL){
 					PRINT(stderr, "Rendering failed for char %d\n", (int)sc->c);
@@ -1618,12 +2259,17 @@ void render() {
 				SDL_Rect selrect = {x, y, advance, text_height};
 				invert_rect(&selrect);
 			}
+
 			if(oneoff != NULL){
 				SDL_FreeSurface(oneoff);
 			}
 			x += advance;
 		}
 	}
+
+	/* scrollback search hits are painted as one batch over the finished
+	 * rows (see sessionui.c) */
+	sessionui_draw_search_highlights(screen, content_top);
 
 	if (draw_cursor && buf->view_offset == 0){
 		// draw the cursor
@@ -1641,6 +2287,7 @@ void render() {
 		sc = &buf->text[buf->line][drawcols];
 		if(sc->c){
 			str[0] = sc->c;
+			str[1] = sc->c2;
 			TTF_Font *rfont = font_for_char(sc->c);
 			TTF_SetFontStyle(rfont, sc->style.style);
 			if(buf->inverse_video){
@@ -1657,9 +2304,10 @@ void render() {
 
 		SDL_Rect destrect;
 		destrect.x = cursor_x * advance;
-		destrect.y = cursor_y * text_height;
+		destrect.y = content_top + cursor_y * text_height;
 		destrect.w = cursor->w;
 		destrect.h = cursor->h;
+		int cursor_shape = ecma48_cursor_shape();
 		if(cursor_shape >= 3){
 			/* underline (3/4) or bar (5/6): draw the glyph normally, then
 			 * a solid strip in the text colour */
@@ -1688,7 +2336,7 @@ void render() {
 		/* draw the metamode cursor */
 		SDL_Rect destrect;
 		destrect.x = (cols-1) * advance;
-		destrect.y = 0;
+		destrect.y = content_top;
 		destrect.w = metamode_cursor->w;
 		destrect.h = metamode_cursor->h;
 		SDL_BlitSurface(metamode_cursor, NULL, screen, &destrect);
@@ -1698,7 +2346,7 @@ void render() {
 		/* show that we are scrolled back into history */
 		SDL_Rect destrect;
 		destrect.x = (cols-1) * advance;
-		destrect.y = 0;
+		destrect.y = content_top;
 		destrect.w = scroll_indicator->w;
 		destrect.h = scroll_indicator->h;
 		SDL_BlitSurface(scroll_indicator, NULL, screen, &destrect);
@@ -1709,7 +2357,7 @@ void render() {
 		/* mouse pointer for tracking apps, snapped to its cell */
 		SDL_Rect destrect;
 		destrect.x = (pointer_x / advance) * advance;
-		destrect.y = (pointer_y / text_height) * text_height;
+		destrect.y = content_top + (pointer_y / text_height) * text_height;
 		destrect.w = mouse_pointer->w;
 		destrect.h = mouse_pointer->h;
 		SDL_BlitSurface(mouse_pointer, NULL, screen, &destrect);
@@ -1718,7 +2366,7 @@ void render() {
 	if(vmodifiers & KEYMOD_CTRL){
 		SDL_Rect destrect;
 		destrect.x = (cols-1) * advance;
-		destrect.y = 1 * text_height;
+		destrect.y = content_top + 1 * text_height;
 		destrect.w = ctrl_key_indicator->w;
 		destrect.h = ctrl_key_indicator->h;
 		SDL_BlitSurface(ctrl_key_indicator, NULL, screen, &destrect);
@@ -1727,7 +2375,7 @@ void render() {
 	if(vmodifiers & KEYMOD_ALT){
 		SDL_Rect destrect;
 		destrect.x = (cols-1) * advance;
-		destrect.y = 2 * text_height;
+		destrect.y = content_top + 2 * text_height;
 		destrect.w = alt_key_indicator->w;
 		destrect.h = alt_key_indicator->h;
 		SDL_BlitSurface(alt_key_indicator, NULL, screen, &destrect);
@@ -1736,7 +2384,7 @@ void render() {
 	if(vmodifiers & KEYMOD_SHIFT){
 		SDL_Rect destrect;
 		destrect.x = (cols-1) * advance;
-		destrect.y = 3 * text_height;
+		destrect.y = content_top + 3 * text_height;
 		destrect.w = shift_key_indicator->w;
 		destrect.h = shift_key_indicator->h;
 		SDL_BlitSurface(shift_key_indicator, NULL, screen, &destrect);
@@ -1745,10 +2393,54 @@ void render() {
 	if (altsym_lock || altsym_hold) {
 		SDL_Rect destrect;
 		destrect.x = (cols-1) * advance;
-		destrect.y = 3 * text_height;
+		destrect.y = content_top + 3 * text_height;
 		destrect.w = shift_key_indicator->w;
 		destrect.h = shift_key_indicator->h;
 		SDL_BlitSurface(altsym_indicator, NULL, screen, &destrect);
+	}
+
+	if (pinyin_enabled()) {
+		/* input bar on the reserved bottom row: "[鹤] ni hc 1.你 2.尼 ..." */
+		char st8[1024];
+		UChar st16[512];
+		int32_t slen = 0;
+		UErrorCode serr = U_ZERO_ERROR;
+		SDL_Rect bar;
+		bar.x = 0;
+		bar.w = screen->w;
+		bar.h = text_height;
+		bar.y = screen->h - text_height;
+		if (current_symmenu != NULL && current_symmenu->surface != NULL) {
+			bar.y -= current_symmenu->surface->h;
+		}
+		SDL_FillRect(screen, &bar, SDL_MapRGB(screen->format, 0x18, 0x30, 0x60));
+		pinyin_status(st8, sizeof(st8));
+		u_strFromUTF8(st16, 511, &slen, st8, -1, &serr);
+		if (U_SUCCESS(serr) && slen > 0) {
+			SDL_Color fg = {0xff, 0xff, 0xff, 0};
+			SDL_Color bg = {0x18, 0x30, 0x60, 0};
+			int x = 0, i;
+			/* render glyph by glyph so CJK uses the CJK/fallback font */
+			for (i = 0; i < slen && x < screen->w; ++i) {
+				UChar g[2];
+				SDL_Surface *gs;
+				SDL_Rect gr;
+				g[0] = st16[i];
+				g[1] = 0;
+				TTF_SetFontStyle(font_for_char(g[0]), TTF_STYLE_NORMAL);
+				gs = TTF_RenderUNICODE_Shaded(font_for_char(g[0]), g, fg, bg);
+				if (gs == NULL) {
+					continue;
+				}
+				gr.x = x;
+				gr.y = bar.y;
+				gr.w = gs->w;
+				gr.h = gs->h;
+				SDL_BlitSurface(gs, NULL, screen, &gr);
+				x += gs->w;
+				SDL_FreeSurface(gs);
+			}
+		}
 	}
 
 	if ((current_symmenu != NULL) && (current_symmenu->surface != NULL)) {
@@ -1765,6 +2457,10 @@ void render() {
 		}
 	}
 
+	/* session chrome (tab bar, switcher overlay, prompts) sits on top of
+	 * the terminal and is part of the same frame */
+	sessionui_draw(screen);
+
 	SDL_Flip(screen);
 
 	if(flash){
@@ -1776,139 +2472,49 @@ void render() {
 
 }
 
-static int pty_init() {
-	// Set up the ttys and fork
-
-	struct winsize winp;
-
-	/* some sensible defaults - we change these later */
-	winp.ws_row = 24;
-	winp.ws_col = 80;
-	winp.ws_xpixel = 1024;
-	winp.ws_ypixel = 600;
-
-	int pty_ret;
-	int fd;
-	int uid = getuid();
-	int gid = getgid();
-	char cttyname[L_ctermid];
-	char envstr[100];
-	int slave_fd;
-	int master_fd;
-
-	pty_ret = openpty(&master_fd, &slave_fd, slave_ptyname, NULL, &winp);
-	if (pty_ret != 0){
-		// error
-		PRINT(stderr, "openpty returned: %s\n", strerror(errno));
-		close(master_fd);
-		close(slave_fd);
-		return TERM_FAILURE;
-	} else {
-		PRINT(stderr, "openpty returned name: %s\n", slave_ptyname);
-	}
-
-	// turn off blocking on the master pty
-	fcntl(master_fd, F_SETFL, fcntl(master_fd, F_GETFL) | O_NONBLOCK);
-
-	// store the master_fd in IO
-	io_set_master(master_fd);
-
-	// fork and exec
-	child_pid = fork();
-
-	if (child_pid == 0) {
-		// Child
-		/*
-		  struct termios tios;
-		  if (tcgetattr(STDIN_FILENO, &tios) >= 0)
-		  {
-		  tios.c_lflag &= ~(ECHO | ECHOE | ECHOK | ECHONL);
-		  tios.c_oflag &= ~(ONLCR);
-		  (void) tcsetattr(STDIN_FILENO, TCSANOW, &tios);
-		  }
-		*/
-
-		PRINT(stderr, "fork returned in child\n");
-		ctermid(cttyname);
-		PRINT(stderr, "controlling tty is: %s\n", cttyname);
-
-		if(setuid(uid)<0) {PRINT(stderr, "ERROR (setuid)\n");}
-		if(setgid(gid)<0) {PRINT(stderr, "ERROR (setgid)\n");}
-		if(setsid()<0) {PRINT(stderr, "ERROR (setsid)\n");}
-
-		if(ioctl(slave_fd, TIOCSCTTY, NULL)) {
-			PRINT(stderr, "ERROR! (ioctl): %s\n", strerror(errno));
-		}
-
-		dup2(slave_fd, STDIN_FILENO);
-		dup2(slave_fd, STDOUT_FILENO);
-		dup2(slave_fd, STDERR_FILENO);
-
-		ecma48_setenv();
-
-		/* add in our private binary path */
-		char* home = getenv("SANDBOX");
-		char* path = getenv("PATH");
-		char* root = "app/native/root/bin";
-		char* newpath;
-		int err = 0;
-		int newpath_len = 0;
-		if(home == NULL || path == NULL){
-			fprintf(stderr, "Could not get $HOME or $PATH - not setting private bin dir.\n");
-		} else {
-			newpath_len = strlen(home) + strlen(path) + strlen(root) + 10;
-			newpath = calloc(newpath_len, sizeof(char));
-			if(newpath == NULL){
-				fprintf(stderr, "Could not calloc new $PATH - not setting private bin dir..\n");
-			} else {
-				err = snprintf(newpath, newpath_len, "PATH=%s/%s:%s\n", home, root, path);
-				if(err > 0){
-					err = putenv(strdup(newpath));
-					if(err < 0){
-						fprintf(stderr, "Error in putenv: %d\n%s - private bin may not bein $PATH.\n", errno, newpath);
-					}
-				} else {
-					fprintf(stderr, "Error snprintf setting $PATH: %d\n", errno);
-				}
-				free(newpath);
-			}
-		}
-
-		/* Set LC_CTYPE=en_US.UTF-8
-		 * Which can be overridden in .profile */
-		setenv("LC_CTYPE", "en_US.UTF-8", 0);
-		if(execl("../app/native/root/bin/mksh", "mksh", "-l", (char*)0) == -1){
-			execl("/bin/sh", "sh", "-l", (char*)0);
-		}
-	}
-	if (child_pid == -1){
-		PRINT(stderr, "fork returned: %s\n", strerror(errno));
-		return TERM_FAILURE;
-	}
-
-	// close the slave_fd, not needed anymore
-	close(slave_fd);
-	return TERM_SUCCESS;
-}
 
 extern int SDL_PrivateQuit(void);
+
+/* SIGCHLD only records which children went away: reaping inside the
+ * handler is fine (waitpid is async-signal-safe), but touching the
+ * session list or the UI from here is not. The UI thread calls
+ * session_handle_sigchld() once per event-loop iteration to fold the
+ * results into the session table. */
 void sig_child(int signo){
-	int status;
-
 	int old_errno = errno;
+	(void)signo;
 
-	if(waitpid(child_pid, &status, WNOHANG)){
-		if(WIFEXITED(status)){
-			PRINT(stderr, "Child %d exited normally with status %d\n", child_pid, WEXITSTATUS(status));
-		} else {
-			PRINT(stderr, "Child %d exited abnormally\n", child_pid);
+	for(;;){
+		int status;
+		pid_t pid = waitpid(-1, &status, WNOHANG);
+		int n;
+		if(pid <= 0){ break; }
+		n = session_reaped_count;
+		if(n < 32){
+			session_reaped_pid[n] = pid;
+			session_reaped_status[n] = status;
+			session_reaped_count = n + 1;
 		}
-		exit_application = 1;
-		SDL_PrivateQuit();
-	} else {
-		PRINT(stderr, "Got SIGCHILD for process other than %d\n", child_pid);
 	}
+	/* make the UI thread come back and look */
+	indicate_event_input();
+
 	errno = old_errno;
+}
+
+/* pty fds handed over by session_close(); drained by the render thread */
+#define CLOSE_QUEUE_MAX 16
+static int close_queue[CLOSE_QUEUE_MAX];
+static int close_queue_n = 0;
+
+void queue_close_fd(int fd){
+	if(fd < 0){ return; }
+	if(close_queue_n < CLOSE_QUEUE_MAX){
+		close_queue[close_queue_n++] = fd;
+	} else {
+		/* queue full: leaking an fd is better than yanking it out from
+		 * under a select() in the other thread */
+	}
 }
 
 /* How many UChars of child output we parse before letting go of the input
@@ -1936,17 +2542,60 @@ int run_render(void* data){
 	int n = 0;
 	UChar lbuf[READ_BUFFER_SIZE];
 	ssize_t num_chars = 0;
-	int master = io_get_master();
-	int first_output = 1;
 	int pending = 0;          /* parsed output not yet drawn */
 	Uint32 last_render = 0;
 	Uint32 now, since, wait_ms;
 	struct timeval tv;
 
 	while(!exit_application){
+		int master;
+		int maxfd = event_pipe[0];
+		int i;
+
+		/* Everything that touches the session table happens under the
+		 * input lock; only select() itself runs unlocked. The fd set is
+		 * built here and re-checked after select(), so a session that is
+		 * closed while we wait cannot be dereferenced (its fd stays open
+		 * until this thread closes it from close_queue). */
+		lock_input_lowpri();
+		while(close_queue_n > 0){
+			close(close_queue[--close_queue_n]);
+		}
+		/* Fold reaped children in here as well as in the UI thread: the
+		 * signal only writes to event_pipe, and SDL_WaitEvent does not
+		 * wake on that, so the main loop may not run for a long time. */
+		if(session_handle_sigchld() > 0){
+			pending = 1;
+			if(session_count_alive() == 0 && session_count == 1){
+				/* the only shell is gone: leave, like the single-session
+				 * app always did */
+				SDL_Event quit_event;
+				memset(&quit_event, 0, sizeof(quit_event));
+				quit_event.type = SDL_QUIT;
+				SDL_PushEvent(&quit_event);
+			}
+		}
+		master = io_get_master();
 		FD_ZERO(&fds);
-		FD_SET(master, &fds);
 		FD_SET(event_pipe[0], &fds);
+		if(master >= 0){
+			FD_SET(master, &fds);
+			if(master > maxfd){ maxfd = master; }
+		}
+		/* Background sessions are only watched until they have something
+		 * to read - then they are marked "has output" and dropped from
+		 * the set. Their pty is not drained (the child blocks instead,
+		 * see session.h); the backlog is read when the user switches to
+		 * that tab. Leaving a readable fd in the set would spin this
+		 * loop at 100% CPU. */
+		for(i = 0; i < session_count; ++i){
+			session_t *s = sessions[i];
+			if(s == cur_session || s->master_fd < 0 || s->has_output){ continue; }
+			FD_SET(s->master_fd, &fds);
+			if(s->master_fd > maxfd){ maxfd = s->master_fd; }
+		}
+		unlock_input();
+
 		/* With nothing to draw, block until something happens. With a frame
 		 * owed, wait no longer than the frame deadline. */
 		wait_ms = 0;
@@ -1956,34 +2605,73 @@ int run_render(void* data){
 		}
 		tv.tv_sec = 0;
 		tv.tv_usec = wait_ms * 1000;
-		n = select(1+max(master, event_pipe[0]), &fds, NULL, NULL, pending ? &tv : NULL);
+		n = select(maxfd + 1, &fds, NULL, NULL, pending ? &tv : NULL);
 		if(n < 0){
 			if(errno != EINTR){
 				printf("Error calling select on inputs: %d\n", errno);
 			}
 		} else if(n > 0) {
-			if(FD_ISSET(master, &fds)){
+			lock_input_lowpri();
+			for(i = 0; i < session_count; ++i){
+				session_t *s = sessions[i];
+				if(s == cur_session || s->master_fd < 0 || s->has_output){ continue; }
+				if(FD_ISSET(s->master_fd, &fds)){
+					s->has_output = 1;
+					pending = 1;
+				}
+			}
+			if(master >= 0 && FD_ISSET(master, &fds) && io_get_master() == master){
 				ssize_t budget = DRAIN_UCHARS_PER_FRAME;
-				lock_input_lowpri();
+				int eof = 0;
+				session_t *s = cur_session;
 				// Read anything from the child, up to this frame's budget
-				while(budget > 0 && (num_chars = io_read_master(lbuf, READ_BUFFER_SIZE)) > 0){
+				while(budget > 0){
+					errno = 0;
+					num_chars = io_read_master(lbuf, READ_BUFFER_SIZE);
+					if(num_chars == 0){ eof = 1; break; }
+					if(num_chars < 0){
+						/* EAGAIN/EINTR: nothing (complete) to read right now.
+						 * Anything else (EIO after the child exits) is the
+						 * real end of the session. */
+						if(errno != EAGAIN && errno != EINTR && errno != EWOULDBLOCK){
+							eof = 1;
+						}
+						break;
+					}
 					ecma48_filter_text(lbuf, num_chars);
 					budget -= num_chars;
 				}
-				/* Re-assert the window size once the child first speaks.
-				 * The initial SIGWINCH from sdl_init can be delivered to
-				 * the login shell before it exec()s into a slower shell
-				 * (e.g. `exec zsh`), so that shell never gets a size event
-				 * and its prompt can fail to paint until one arrives. By
-				 * now the child is running and owns the tty foreground
-				 * group, so this WINCH reaches it. */
-				if(first_output){
-					first_output = 0;
-					set_tty_window_size();
+				if(eof && s != NULL){
+					FILE *lf = term49_keylog_fp();
+					if(lf != NULL){
+						fprintf(lf, "session eof fd=%d errno=%d alive=%d\n", master, errno, s->alive);
+						fflush(lf);
+					}
 				}
-				unlock_input();
+				if(s != NULL){
+					if(s->last_output_ticks == 0){
+						/* Re-assert the window size once the child first speaks.
+						 * The initial SIGWINCH from sdl_init can be delivered to
+						 * the login shell before it exec()s into a slower shell
+						 * (e.g. `exec zsh`), so that shell never gets a size event
+						 * and its prompt can fail to paint until one arrives. */
+						set_tty_window_size();
+					}
+					s->last_output_ticks = SDL_GetTicks();
+					if(eof){
+						s->alive = 0;
+						if(s->master_fd >= 0){
+							/* child is gone: stop selecting this fd, or select()
+							 * would report EOF forever */
+							queue_close_fd(s->master_fd);
+							s->master_fd = -1;
+							io_set_master(-1);
+						}
+					}
+				}
 				pending = 1;
 			}
+			unlock_input();
 			if(FD_ISSET(event_pipe[0], &fds)){
 				// Just read the stuff and throw it away (the fd is
 				// non-blocking, so this drains and then returns -1)
@@ -2017,6 +2705,13 @@ int main(int argc, char **argv) {
 	if(home != NULL){ chdir(home); }
 	
 	prefs = read_preferences(PREFS_FILE_PATH);
+	/* Backspace byte: DEL by default, ^H on request. The same byte is
+	 * programmed as the pty's erase character (see session.c). */
+	ecma48_set_backspace((prefs->backspace != NULL &&
+	                      strcmp(prefs->backspace, "bs") == 0) ? 0x08 : 0x7f);
+	/* input method from the config: "full" = 全拼, anything else = 小鹤双拼 */
+	pinyin_set_full(prefs->pinyin_mode != NULL &&
+	                strcmp(prefs->pinyin_mode, "full") == 0);
 	if (is_passport()) {
 		prefs->auto_show_vkb = 1;
 	}
@@ -2024,16 +2719,16 @@ int main(int argc, char **argv) {
 	/* set auto orientation */
 	setenv("AUTO_ORIENTATION", "1", 0);
 
+	/* TERM / terminfo / LC_CTYPE / private PATH for every shell we fork */
+	session_setup_environment();
+
+	/* the session chrome has to know the font metrics before sdl_init
+	 * sizes the grid against it */
+	sessionui_init(prefs, NULL);
+
 	/* Initialize IO */
 	if (TERM_SUCCESS != io_init(prefs)) {
 		PRINT(stderr, "Unable to initialize IO\n");
-		uninit();
-		return TERM_FAILURE;
-	}
-	
-	/* Initialize pty */
-	if (TERM_SUCCESS != pty_init()) {
-		PRINT(stderr, "Unable to initialize pty/tty\n");
 		uninit();
 		return TERM_FAILURE;
 	}
@@ -2058,6 +2753,18 @@ int main(int argc, char **argv) {
 
 	/* render the symmenus */
 	prefs->main_symmenu->surface = render_symmenu(screen, prefs, prefs->main_symmenu);
+	if (prefs->action_menu != NULL) {
+		prefs->action_menu->surface = render_symmenu(screen, prefs, prefs->action_menu);
+	}
+
+	/* Pinyin (xiaohe shuangpin) is on by default; TERM49_PINYIN=0 gives a
+	 * plain terminal back. The bar is toggled from the Menu popup. */
+	if (getenv("TERM49_PINYIN") == NULL || atoi(getenv("TERM49_PINYIN")) != 0) {
+		if (!pinyin_enabled()) {
+			pinyin_toggle();
+		}
+		pinyin_set_bar(pinyin_enabled());
+	}
 	for (char c = 'a'; c <= 'z'; ++c) {
 		size_t idx = (size_t)(c - 'a');
 
@@ -2112,34 +2819,49 @@ int main(int argc, char **argv) {
 			}
 			break;
 		case SDL_MOUSEBUTTONDOWN:
+		{
+			int ty = event.button.y - content_top;
+			touch_down_ticks = SDL_GetTicks();
+			touch_down_x = event.button.x;
+			touch_down_y = event.button.y;
+			/* the tab bar / switcher / prompt gets first refusal */
+			if(sessionui_touch_down(event.button.x, event.button.y)){
+				break;
+			}
 			handle_mousedown(event.button.x, event.button.y);
 			if(event.button.which == 0 && (altsym_lock || altsym_hold)){
 				/* alt + touch begins a text selection */
-				int bufrow = event.button.y / text_height + buf->top_line - buf->view_offset;
+				int bufrow = ty / text_height + buf->top_line - buf->view_offset;
 				int bufcol = event.button.x / advance;
 				buf_sel_begin(bufrow, bufcol);
 				touch_selecting = 1;
 			} else if(event.button.which == 0 && ecma48_mouse_tracking() && buf->view_offset == 0){
 				/* in mouse-tracking apps a touch is a left mouse press */
 				touch_mouse_cell[0] = event.button.x / advance + 1;
-				touch_mouse_cell[1] = event.button.y / text_height + 1;
+				touch_mouse_cell[1] = ty / text_height + 1;
 				ecma48_send_mouse_event(0, 1, touch_mouse_cell[0], touch_mouse_cell[1]);
 			} else if(event.button.which == 0){
 				/* a plain tap clears any existing selection */
 				buf_sel_cancel();
 			}
 			break;
+		}
 		case SDL_MOUSEMOTION:
+		{
+			int ty = event.motion.y - content_top;
+			if(sessionui_touch_motion(event.motion.x, event.motion.y)){
+				break;
+			}
 			if(event.motion.which == 0 && event.motion.state){
 				if(touch_selecting){
 					/* extend the selection to the finger */
-					int bufrow = event.motion.y / text_height + buf->top_line - buf->view_offset;
+					int bufrow = ty / text_height + buf->top_line - buf->view_offset;
 					int bufcol = event.motion.x / advance;
 					buf_sel_update(bufrow, bufcol);
 				} else if(touch_mouse_cell[0] > 0){
 					/* mouse-tracking app: report the drag */
 					int mcol = event.motion.x / advance + 1;
-					int mrow = event.motion.y / text_height + 1;
+					int mrow = ty / text_height + 1;
 					int mmode = ecma48_mouse_tracking();
 					if((mcol != touch_mouse_cell[0] || mrow != touch_mouse_cell[1]) &&
 					   (mmode == 1002 || mmode == 1003)){
@@ -2159,7 +2881,30 @@ int main(int argc, char **argv) {
 				}
 			}
 			break;
+		}
 		case SDL_MOUSEBUTTONUP:
+		{
+			int ty = event.button.y - content_top;
+			if(sessionui_touch_up(event.button.x, event.button.y)){
+				touch_down_ticks = 0;
+				touch_scroll_acc = 0;
+				break;
+			}
+			if(event.button.which == 0 && !touch_selecting && touch_mouse_cell[0] <= 0 &&
+			   !ecma48_mouse_tracking() && touch_down_ticks > 0 &&
+			   (SDL_GetTicks() - touch_down_ticks) < 400 &&
+			   abs(event.button.x - touch_down_x) < 12 &&
+			   abs(event.button.y - touch_down_y) < 12){
+				/* a short tap that did not scroll or select: open a URL
+				 * under the finger, if there is one */
+				int bufrow = ty / text_height + buf->top_line - buf->view_offset;
+				int bufcol = event.button.x / advance;
+				if(sessionui_open_url_at(bufrow, bufcol)){
+					touch_down_ticks = 0;
+					break;
+				}
+			}
+			touch_down_ticks = 0;
 			if(event.button.which == 0 && touch_selecting){
 				/* finishing an alt+touch drag copies the selection */
 				int sel_len = 0;
@@ -2171,12 +2916,13 @@ int main(int argc, char **argv) {
 				touch_selecting = 0;
 			} else if(event.button.which == 0 && touch_mouse_cell[0] > 0){
 				ecma48_send_mouse_event(0, 0,
-				        event.button.x / advance + 1, event.button.y / text_height + 1);
+				        event.button.x / advance + 1, ty / text_height + 1);
 				touch_mouse_cell[0] = -1;
 				touch_mouse_cell[1] = -1;
 			}
 			touch_scroll_acc = 0;
 			break;
+		}
 		case SDL_USEREVENT:
 			/* posted by SDL for the app-menu request (swipe down from the
 			 * top bezel; the Classic menu key may arrive this way too):
@@ -2190,12 +2936,44 @@ int main(int argc, char **argv) {
 			PRINT(stderr, "Unknown Event: %d\n", event.type);
 			break;
 		}
+
+		/* fold reaped children into the session table, then let the UI
+		 * catch up with anything that changed (a tab height change from a
+		 * prompt, a session that just exited, ...) */
+		session_handle_sigchld();
+		if(session_exit_requested){
+			exit_application = 1;
+		}
+		if(cur_session != NULL && !cur_session->alive &&
+		   session_count_alive() == 0 && session_count == 1){
+			/* the only shell exited: keep the historic behaviour and leave */
+			exit_application = 1;
+		}
+		if(sessionui_take_layout_change()){
+			/* Only re-lay-out when the bar actually took or gave back
+			 * screen space: opening the switcher overlay must not send
+			 * SIGWINCH to every shell (vim/tmux would redraw for nothing). */
+			if(sessionui_bar_height() != content_top || rows == 0){
+				int sh = screen->h;
+				if(virtualkeyboard_visible){ sh -= get_virtualkeyboard_height(); }
+				setup_screen_size(screen->w, sh);
+				if(cur_session != NULL){ buf_reset_view(); }
+			}
+			indicate_event_input();
+		}
 		indicate_event_input();
 		unlock_input();
 	}
 
 	PRINT(stderr, "Exiting run loop\n");
-	SDL_KillThread(render_thread);
+	/* Ask the render thread to leave instead of killing it: SDL_KillThread
+	 * cancels it wherever it happens to be, which is exactly the sort of
+	 * thing that turns a clean exit into an abort() inside malloc when the
+	 * heap is torn down a moment later. The pipe write wakes it out of
+	 * select(). */
+	exit_application = 1;
+	indicate_event_input();
+	SDL_WaitThread(render_thread, NULL);
 	virtualkeyboard_hide();
 	uninit();
 

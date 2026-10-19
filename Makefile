@@ -35,7 +35,7 @@ LDOPTS    	:= -Wl,-z,relro -Wl,-z,now
 
 ASSET      	:= Device-Debug
 BINARY     	:= Term49
-BAR        	:= Term49C.bar
+BAR        	:= Term49X.bar
 BINARY_PATH	:= $(ASSET)/$(BINARY)
 
 SRCS := $(wildcard src/*.c)
@@ -43,9 +43,19 @@ OBJS := $(SRCS:.c=.o )
 
 -include ./signing/bbpass
 
-.PHONY: all clean package-debug deploy launch-debug
+.PHONY: all clean package-debug deploy launch-debug clear-tool
 
 all: package-debug
+
+# stand-alone helpers shipped in the bar
+CLEAR       := Device-Debug/clear
+
+# clear links against libc only: libSDL12.so has undefined references to the
+# app's own key handlers, so it cannot be on this link line.
+$(CLEAR): tools/clear.c
+	mkdir -p $(ASSET)
+	$(CC) $(INCLUDE) -V$(QCC_TARGET) -Wc,-std=gnu99 $(DEBUGFLAGS) \
+		-L$(QNX_TARGET)/armle-v7/lib $(LDOPTS) $< -o $(CLEAR)
 
 $(BINARY): $(OBJS)
 	mkdir -p $(ASSET)
@@ -54,9 +64,11 @@ $(BINARY): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $(DEFINES) $< -o $@
 
+clear-tool: $(CLEAR)
+
 clean:
 	@rm -fv src/*.o
-	@rm -fv $(BINARY_PATH)
+	@rm -fv $(BINARY_PATH) $(CLEAR)
 	@rmdir -v $(ASSET)
 	@rm -fv $(BAR)
 

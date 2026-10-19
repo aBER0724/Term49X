@@ -376,7 +376,12 @@ void destroy_preferences(pref_t *pref) {
 	while (m->to != NULL) { free(m->to); ++m; }
 	free(pref->metamode_func_keys);
 
+	free(pref->backspace);
+	free(pref->pinyin_mode);
 	destroy_symmenu(pref->main_symmenu);
+	if (pref->action_menu != NULL) {
+		destroy_symmenu(pref->action_menu);
+	}
 	
 	free(pref->keyhold_actions_exempt);
 
@@ -451,8 +456,13 @@ pref_t *read_preferences(const char* filename) {
 	DEFAULT_LOOKUP(int, config, "scrollback_lines", prefs->scrollback_lines, DEFAULT_SCROLLBACK_LINES);
 	DEFAULT_LOOKUP(string, config, "back_button_keys", prefs->back_button_keys, DEFAULT_BACK_BUTTON_KEYS);
 	prefs->back_button_keys = strdup(prefs->back_button_keys);
+	DEFAULT_LOOKUP(string, config, "backspace", prefs->backspace, DEFAULT_BACKSPACE);
+	prefs->backspace = strdup(prefs->backspace);
+	DEFAULT_LOOKUP(string, config, "pinyin_mode", prefs->pinyin_mode, DEFAULT_PINYIN_MODE);
+	prefs->pinyin_mode = strdup(prefs->pinyin_mode);
 
 	prefs->main_symmenu = create_symmenu(config, "main_symmenu", DEFAULT_SYMMENU_NUM_ROWS, DEFAULT_SYMMENU_ROW_LENS, DEFAULT_SYMMENU_ENTRIES);
+	prefs->action_menu = create_symmenu(config, "menu_actions", DEFAULT_MENU_NUM_ROWS, DEFAULT_MENU_ROW_LENS, DEFAULT_MENU_ENTRIES);
 	prefs->altsym_entries = create_keymap_array(config, "altsym_entries", DEFAULT_ALTSYM_ENTRIES_LEN, DEFAULT_ALTSYM_ENTRIES);
 
 	/* the accent menus are configurable, but we won't include them in the default config */

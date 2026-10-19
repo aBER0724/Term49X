@@ -44,6 +44,11 @@ void rescreen();
 void setup_screen_size(int w, int h);
 void set_screen_cols(int cols);
 
+/* Hand a pty fd to the render thread for closing. The render thread may
+ * be blocked in select() on it, so it is closed there, at the top of the
+ * loop, after the fd sets have been rebuilt. */
+void queue_close_fd(int fd);
+
 int init();
 void uninit();
 

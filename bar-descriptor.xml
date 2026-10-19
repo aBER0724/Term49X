@@ -13,9 +13,11 @@
    -->
 
 <qnx xmlns="http://www.qnx.com/schemas/application/1.0">
-    <id>com.example.Term49_Classic</id>
+    <id>com.example.Term49X</id>
     <asset path="share/terminfo">terminfo</asset>
     <asset path="share/root">root</asset>
+    <asset path="share/xiaohe.dict">xiaohe.dict</asset>
+    <asset path="Device-Debug/clear" entry="false" type="Qnx/Elf">root/bin/clear</asset>
     <asset path="share/NOTICE">NOTICE</asset>
     <asset path="share/LICENSE">LICENSE</asset>
     <asset path="share/README">README</asset>
@@ -28,6 +30,8 @@
     
     <asset path="external/fonts/CascadiaMonoPL-Regular.ttf">fonts/CascadiaMonoPL-Regular.ttf</asset>
     <asset path="external/fonts/LICENSE-Cascadia">fonts/LICENSE-Cascadia</asset>
+    <asset path="external/fonts/SymbolsNerdFontMono-Regular.ttf">fonts/SymbolsNerdFontMono-Regular.ttf</asset>
+    <asset path="external/fonts/LICENSE-SymbolsNerdFont">fonts/LICENSE-SymbolsNerdFont</asset>
     <asset path="external/lib/libconfig.so" type="Qnx/Elf">lib/libconfig.so.11</asset>
     <asset path="external/lib/libSDL12.so" type="Qnx/Elf">lib/libSDL12.so</asset>
     <asset path="external/lib/libTouchControlOverlay.so" type="Qnx/Elf">lib/libTouchControlOverlay.so</asset>
@@ -40,17 +44,21 @@
        <asset path="Device-Release/Term49" entry="true" type="Qnx/Elf">Term49</asset>
     </configuration>
 
-    <name>Term49C</name>
-    <versionNumber>1.0.0</versionNumber>
+    <name>Term49X</name>
+    <versionNumber>2.3.1</versionNumber>
     <buildId>1</buildId>
 
     <!-- May have multiple values for each language. See samples or xsd schema file. -->
-    <description>The Term49 application</description>
+    <description>Term49X: multi-session terminal with tabs, scrollback search and URL opening</description>
 
-    <!--  Must match the developer name of your developer certificate. -->
-    <author>Package-Author</author>
-    <!--  Unique author ID assigned by signing authority. Required if using debug tokens. -->
-    <authorId>Package-Author-Id</authorId>
+    <!-- These have to be syntactically valid even for an unsigned bar, or
+         the packager/installer rejects MANIFEST.MF. They do not grant any
+         signing identity: the bar is unsigned and meant for rooted devices. -->
+    <author>Term49X</author>
+    <!-- 20 bytes, urlsafe base64, no padding (27 chars). The packager
+         rejects anything else, even for an unsigned bar. This is a random
+         placeholder, not a BlackBerry signing identity. -->
+    <authorId>gYAADDZj2iHKIvJUnx5m9igD-vo</authorId>
 
     <initialWindow>
       <autoOrients>true</autoOrients>

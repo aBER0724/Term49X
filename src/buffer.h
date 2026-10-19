@@ -18,6 +18,7 @@
 #define BUFFER_H_
 
 #include <unicode/utf.h>
+#include "SDL.h"
 
 #define NUM_BUFFERS 2
 
@@ -26,10 +27,14 @@ struct font_style {
   SDL_Color bg_color;
   int style;
   char reverse;
+  char dim;              /* SGR 2: halve the intensity of the foreground */
 };
 
 struct screenchar {
   UChar c;
+  /* second UTF-16 unit of this cell: the low surrogate of a non-BMP
+   * character (emoji, rare CJK), or one combining mark. 0 = none. */
+  UChar c2;
   struct font_style style;
   SDL_Surface* surface;
   /* 0 = single-width, 1 = lead cell of a double-width (CJK) char whose
@@ -122,5 +127,16 @@ void buf_save_text();
 void buf_restore_text();
 void buf_save_cursor();
 void buf_restore_cursor();
+/* ---- per-session buffer state --------------------------------------
+ * buffer.c keeps its state in file-scope globals (buf, screens, tabs,
+ * sr, selection, ...). A session switch copies those globals into/out of
+ * the session block, so a whole terminal can be parked without touching
+ * the thousands of lines that use the globals. */
+struct session_t;
+
+int  buffer_state_init(struct session_t *s);   /* allocate a session's buffers */
+void buffer_state_free(struct session_t *s);   /* release them */
+void buffer_state_save(struct session_t *s);   /* live globals -> session */
+void buffer_state_load(struct session_t *s);   /* session -> live globals */
 
 #endif /* BUFFER_H_ */

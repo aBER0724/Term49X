@@ -76,6 +76,20 @@ static int PREFS_VERSION = 9;
     {'a', "~"}, {'s', "4"}, {'d', "5"}, {'f', "6"}, {'g', "\\"}, {'h', "|"}, {'j', "&"}, {'k', "`"}, {'l', "="}, \
     {'0', "0"}, {'z', "7"}, {'x', "8"}, {'c', "9"}, {'v', "{"}, {'b', "}"}, {'n', "["}, {'m', "]"}, {'$', "\x1b[A"} \
 }
+/* Menu key popup: a uniform 2 x 8 grid.
+ * Row 1: Ctrl shortcuts (raw control bytes).
+ * Row 2: more Ctrl shortcuts + Term49 actions (see handle_menu_action). */
+#define DEFAULT_MENU_NUM_ROWS 3
+#define DEFAULT_MENU_ROW_LENS (int[]){8, 8, 11}
+#define DEFAULT_MENU_ENTRIES (keymap_t[]){ \
+    {'c', "\x03"}, {'d', "\x04"}, {'z', "\x1a"}, {'l', "\x0c"}, \
+    {'a', "\x01"}, {'e', "\x05"}, {'u', "\x15"}, {'w', "\x17"}, \
+    {'r', "\x12"}, {'k', "\x0b"}, {'v', "paste_clipboard"}, {'p', "pinyin_toggle"}, \
+    {'b', "vkb_toggle"}, {'x', "clear_screen"}, {'s', "rescreen"}, {'q', "menu_close"}, \
+    {'f', "pinyin_full"}, {'n', "session_new"}, {'m', "session_menu"}, {'/', "session_search"}, \
+    {'j', "session_close"}, {'t', "session_rename"}, {'0', "session_bar"}, {'h', "screenshot"}, \
+    {'g', "dump_grid"}, {'y', "session_new_utf8"}, {'z', "session_new_zsh"}}
+
 #define DEFAULT_STICKY_SYM_KEY 1
 #define DEFAULT_STICKY_SHIFT_KEY 1
 #define DEFAULT_STICKY_ALT_KEY 1
@@ -92,6 +106,13 @@ static int PREFS_VERSION = 9;
 
 /* keystrokes sent by the hardware back button (Esc) */
 #define DEFAULT_BACK_BUTTON_KEYS "\x1b"
+
+/* what the Backspace key sends to the pty: "del" (0x7f, xterm default,
+ * required by full-screen programs like claude/vim) or "bs" (0x08) */
+#define DEFAULT_BACKSPACE "del"
+
+/* input method: "xiaohe" (小鹤双拼, default) or "full" (全拼) */
+#define DEFAULT_PINYIN_MODE "xiaohe"
 
 /* extra scrollback history in lines (scroll with a touch drag or
  * alt + trackpad); 0 keeps only the historic two-screens buffer */

@@ -1,28 +1,32 @@
-Welcome to Term49C!
+Welcome to Term49X!
 
-Term49C ("C" = Classic) is a BlackBerry 10 terminal
-emulator tuned for the BlackBerry Classic (Q20) hardware
-— physical keyboard, trackpad, and belt keys — while still
-usable on other BB10 devices. It continues Term48/Term49.
+Term49X is a BlackBerry 10 terminal emulator for the
+BlackBerry Classic (Q20) hardware — physical keyboard,
+trackpad, and belt keys — and for other BB10 devices. It
+continues Term48/Term49/Term49X, and adds multiple shells
+(tabs + session switcher), scrollback search, and
+tap-to-open URLs.
 
 This file is linked into your home directory on first
 launch. Topics:
 
 1. QUICK START
-2. CLASSIC HARDWARE (trackpad, belt keys)
-3. MOUSE, SCROLLBACK, COPY/PASTE
-4. SHIFT+TAB AND KEY TABLES
-5. PREFERENCES
-6. WHAT'S INSTALLED
-7. SOURCE / HELP
+2. SESSIONS (TABS), SWITCHER AND SEARCH
+3. PINYIN / 双拼 INPUT BAR (小鹤双拼)
+4. CLASSIC HARDWARE (trackpad, belt keys)
+5. MOUSE, SCROLLBACK, COPY/PASTE
+6. SHIFT+TAB AND KEY TABLES
+7. PREFERENCES
+8. WHAT'S INSTALLED
+9. SOURCE / HELP
 
 ===========================================================
 
 1. QUICK START
 
 Special keys (Ctrl, Alt, arrows, etc.) via metamode:
-touch the top-left corner of the screen, then press a
-key. A green 'M' appears top-right while metamode is on.
+touch the top-left corner of the screen (just below the
+tab bar), then press a key. A green 'M' appears top-right while metamode is on.
 Touch the corner again to leave metamode.
 
 Default metamode keys:
@@ -47,7 +51,7 @@ Double-tap Shift is optional and device-dependent. The default
 is double-tap *right* Shift (metamode_doubletap_key =
 KEYCODE_RIGHT_SHIFT). On the BlackBerry Classic (Q20) that
 does **not** work: the hardware does not deliver a distinct
-right-Shift event the way Term49C expects. Use hold-Space or
+right-Shift event the way Term49X expects. Use hold-Space or
 the top-left hitbox on Classic instead. On other devices (or
 Bluetooth keyboards that send right Shift) double-tap may work;
 you can also set metamode_doubletap_key to left Shift if your
@@ -58,7 +62,118 @@ Menu belt key for persistent Alt (see below).
 
 ===========================================================
 
-2. CLASSIC HARDWARE (trackpad, belt keys)
+2. SESSIONS (TABS), SWITCHER AND SEARCH
+
+The terminal runs several shells at once. Each one has its
+own screen, scrollback, parser state and child process.
+
+TAB BAR (top of the screen, one tab per shell)
+
+  +        open a new shell (a new tab)
+  =        open the session switcher overlay (hamburger)
+  tab      tap to switch to that shell
+  swipe    swipe left/right across the bar to go to the
+           next / previous shell
+  dot      a small dot on a tab means that shell produced
+           output while you were looking at another one
+  active   tapping the active tab opens the switcher
+
+Hide the bar to get the whole screen back: metamode '0'.
+The terminal grid is re-flowed to use the space.
+
+SWITCHER OVERLAY ('=' on the bar, or metamode 'b')
+
+  - one row per shell: tap the row to switch to it
+  - R: rename that shell
+  - x: close that shell (its process gets SIGHUP)
+  - "+ New session" at the bottom
+  - x (top right) closes the overlay
+
+KEYBOARD (all inside metamode, after the corner / Space)
+
+  n   new session            b   session switcher
+  r   rename current         x   close current
+  f   search scrollback      [ ] previous / next session
+  1-9 switch to session 1..9    0   show/hide the tab bar
+
+These bindings are built in, so they work with an old
+~/.term49rc that has no entries for them; your own
+metamode bindings are checked first and still win.
+
+To bind them yourself, add to metamode_func_keys in
+~/.term49rc:
+
+  ("s", "session_menu")   ("n", "session_new")
+  ("r", "session_rename") ("f", "session_search")
+  ("[", "session_prev")   ("]", "session_next")
+  ("x", "session_close")  ("0", "session_bar")
+
+SEARCH (metamode 'f')
+
+  Type to search the whole scrollback (case-insensitive).
+    Enter / Tab / >      next hit
+    < / Left / Up        previous hit
+    x / Escape           close and return to the live view
+  Hits are highlighted; the current one is underlined and
+  scrolled into the middle of the screen.
+
+URLS
+
+  A short tap on a http://, https://, ftp://, www. or
+  mailto: token opens it in the browser. Taps that scrolled
+  the view or that are part of a text selection are ignored.
+
+NOTES
+
+  - Output from a shell you are not looking at waits in the
+    tty buffer and is read the moment you switch to that
+    tab. Nothing is lost, but a program that writes
+    non-stop (yes, a fast log) blocks until you look at it.
+  - A shell that exits stays as a red tab so its last output
+    stays readable. If it was the only session, the app
+    exits, as it always has.
+  - Session names are not saved across app restarts.
+  - Up to 8 sessions; each one costs a scrollback buffer.
+
+===========================================================
+
+3. PINYIN / 双拼 INPUT BAR (小鹤双拼)
+
+The terminal has its own pinyin input method (no system
+IME needed). It is on by default; the bottom row shows
+
+  [鹤] ni hc | 1.你 2.尼 3.泥 4.拟 >
+
+  letters   build the code (xiaohe shuangpin: "nihc" = 你好)
+  1 - 9     pick candidate 1..9 of the current page
+  space     pick candidate 1
+  .  or =   next page        ,  or -   previous page
+  backspace delete a letter
+  enter     commit the raw letters
+  Esc/Back  cancel the composition
+  other key picks candidate 1, then acts normally
+
+Candidates are read from $HOME/term49_xiaohe.dict
+(fallback: app/native/xiaohe.dict,
+/accounts/1000/shared/misc/term49_xiaohe.dict).
+
+两种输入方式，同一份词典：默认小鹤双拼（固定两键，
+如 nihc = 你好），也可以切成全拼（nihao = 你好）。
+切换：Menu 键 -> f（标签显示 全/鹤）。固定用全拼就在
+~/.term49rc 里写 pinyin_mode = "full";
+
+Backspace sends DEL (0x7f) and the tty erase char is
+set to match, so claude/vim/less delete properly. If an
+old setup needs ^H instead, put backspace = "bs"; in
+~/.term49rc (default is "del").
+
+Menu key (BlackBerry key) opens the action popup: "CN"
+toggles the bar, "Kbd" the virtual keyboard, "Paste"
+pastes, "Cls" clears, "Fix" rescreens. Start with
+TERM49_PINYIN=0 to have the bar off; TERM49_MENU_ALT=1
+restores the old Menu = sticky-Alt behaviour.
+
+4. CLASSIC HARDWARE (trackpad, belt keys)
 
 TRACKPAD
   Swipe: arrow keys (history, cursor, vi/less, etc.).
@@ -80,7 +195,7 @@ BELT KEYS
 
 ===========================================================
 
-3. MOUSE, SCROLLBACK, COPY/PASTE
+5. MOUSE, SCROLLBACK, COPY/PASTE
 
 MOUSE (xterm reporting: DECSET 9/1000/1002/1003, SGR 1006)
 When an app enables mouse tracking (tmux mouse, vim
@@ -119,7 +234,7 @@ CJK / DOUBLE-WIDTH
 
 ===========================================================
 
-4. SHIFT+TAB AND KEY TABLES
+6. SHIFT+TAB AND KEY TABLES
 
 With Shift held or sticky shift armed (↑ indicator):
   - Virtual keyboard Tab → back-tab (ESC [ Z)
@@ -130,13 +245,13 @@ With Shift held or sticky shift armed (↑ indicator):
 
 ===========================================================
 
-5. PREFERENCES
+7. PREFERENCES
 
 File: ~/.term49rc (libconfig syntax). Created with
 defaults on first launch if missing. Errors fall back
 to compiled defaults.
 
-Selected options and Term49C defaults:
+Selected options and Term49X defaults:
 
 font_path = "/usr/fonts/font_repository/dejavu/DejaVuSansMono.ttf";
 fallback_font_path = "../app/native/fonts/CascadiaMonoPL-Regular.ttf";
@@ -220,21 +335,21 @@ prefs_version = <int>
 
 ===========================================================
 
-6. WHAT'S INSTALLED
+8. WHAT'S INSTALLED
 
 Stock BB10 userland is sparse. You get basic file tools
-(ls, less, mv, …), python, elvis (vi-like). Term49C also
+(ls, less, mv, …), python, elvis (vi-like). Term49X also
 bundles mksh (better Unicode shell), ssh, scp, sftp, and
 ssh-keygen under the app private bin path.
 
 ===========================================================
 
-7. SOURCE / HELP
+9. SOURCE / HELP
 
-Term49C is open source (SDL, freetype, libconfig, ICU,
+Term49X is open source (SDL, freetype, libconfig, ICU,
 xterm-style sequences). Project home:
 
-  https://github.com/jxw1102/Term49C
+  https://github.com/jxw1102/Term49X
 
 Upstream lineage: BerryFarm/Term49, mordak/Term48.
 

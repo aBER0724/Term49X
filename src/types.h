@@ -42,6 +42,8 @@ typedef struct _pref_t {
 	keymap_t *metamode_keys, *metamode_sticky_keys, *metamode_func_keys;
 	
 	symmenu_t *main_symmenu;
+	/* popup action menu (Menu key): paste / vkb / snippets */
+	symmenu_t *action_menu;
 	symmenu_t *accent_menus[26][2];
 	symmenu_t *altsym_entries;
 	
@@ -55,6 +57,12 @@ typedef struct _pref_t {
 
 	/* keystrokes sent by the hardware back button */
 	char *back_button_keys;
+
+	/* what the Backspace key sends: "del" (0x7f) or "bs" (0x08) */
+	char *backspace;
+
+	/* input method: "xiaohe" (shuangpin) or "full" (pinyin) */
+	char *pinyin_mode;
 
 	/* extra lines of scrollback history */
 	int scrollback_lines;
